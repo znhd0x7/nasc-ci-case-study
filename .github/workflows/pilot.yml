@@ -1,0 +1,246 @@
+# pilot v1 (24 Nov 2026). Two-commit pilot of the case study, started by hand
+# (Actions tab > pilot > Run workflow).
+#   test     the unit tests (sample-mode iteration means), before any runner time is spent on JMH
+#   record   commits 1 and 2 of case-study/commits.txt, each in its own job (a fresh VM, as in CI):
+#            all 16 benchmarks, JMH -bm sample -tu ns -f 3 -wi 10 -i 20 -w 1s -r 1s
+#   confirm  builds both commits and forces one NASC confirmation of heapSort80 and serialIndexOf250
+#            of commit 2: candidate and parent re-measured back to back in this one job; then the
+#            report (job summary + report.md), pilot.json and history.json
+# Java is Temurin 8.0.514+1 (1.8.0_514-b01) in every job, set up exactly as in build-check v3:
+# checksum verification on, one retry after a pause, a clear stop if both fail, never another JDK.
+# Every artifact is kept 90 days; copy them into the private results folder before then.
+name: pilot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: measurements
+  cancel-in-progress: false
+
+env:
+  JMH_RECORD: -bm sample -tu ns -f 3 -wi 10 -i 20 -w 1s -r 1s -foe true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      commits: ${{ steps.read.outputs.commits }}
+      parent: ${{ steps.read.outputs.parent }}
+      candidate: ${{ steps.read.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Unit tests
+        run: |
+          pip install numpy pandas pytest
+          python -m pytest -q tests
+      - name: Check the NASC-CI version stamp
+        run: |
+          python -c "import nasc_ci; print(nasc_ci.VERSION)"
+          grep -Eq '^[0-9a-f]{40}$' nasc_ci/VERSION || { echo "::error title=No version stamp::nasc_ci/VERSION must hold one 40-character commit hash"; exit 1; }
+          echo "NASC-CI source: $(cat nasc_ci/VERSION)"
+      - id: read
+        name: Pick commits 1 and 2 of case-study/commits.txt
+        run: |
+          python3 -c "
+          import json
+          rows = [l.split()[:2] for l in open('case-study/commits.txt') if l.strip() and not l.startswith('#')][:2]
+          print('commits=' + json.dumps([{'pos': int(p), 'tag': '%02d' % int(p), 'sha': s} for p, s in rows]))
+          print('parent=' + rows[0][1])
+          print('candidate=' + rows[1][1])
+          " >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  record:
+    needs: test
+    name: record ${{ matrix.pos }} (${{ matrix.sha }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.test.outputs.commits) }}
+    steps:
+      - name: Start the clock
+        run: mkdir -p out && echo "job_start=$(date +%s)" > out/timing.txt
+      - name: Check out the case-study files
+        uses: actions/checkout@v7
+        with:
+          path: tools
+      - name: Check out jenetics at the studied commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.sha }}
+          path: jenetics-src
+      - name: Set up Java 8 (Temurin 8.0.514+1)
+        id: java1
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+      - name: Pause and clear the failed Java download
+        if: steps.java1.outcome == 'failure'
+        run: |
+          echo "First Java setup failed; waiting 60 s and retrying from scratch."
+          rm -rf "$RUNNER_TOOL_CACHE/Java_Temurin-Hotspot_jdk/8.0.514-1"
+          sleep 60
+      - name: Set up Java 8 (Temurin 8.0.514+1), second try
+        id: java2
+        if: steps.java1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+      - name: Stop if Java could not be set up
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome != 'success'
+        run: |
+          echo "::error title=Java setup failed twice::Temurin 8.0.514+1 could not be downloaded and verified. Re-run this job (Re-run failed jobs); do not change the JDK."
+          exit 1
+      - name: Check the JDK build
+        run: |
+          java -version 2>&1 | tee out/jdk.txt
+          grep -q "Temurin" out/jdk.txt && grep -q "1.8.0_514-b01" out/jdk.txt || {
+            echo "::error title=Wrong JDK::expected Temurin 1.8.0_514-b01"; exit 1; }
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install numpy
+        run: |
+          pip install numpy
+          pip freeze > out/python-packages.txt
+      - name: Build the JMH jar
+        working-directory: jenetics-src
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain \
+            --init-script ../tools/case-study/print-jmh-classpath.gradle \
+            :jenetics:jmhJar :jenetics:printJmhClasspath
+      - name: Check the benchmarks
+        run: |
+          JAR=$(ls jenetics-src/jenetics/build/libs/*-jmh.jar | head -1)
+          echo "$JAR:$(cat jenetics-src/jenetics/build/jmh-classpath.txt)" > classpath.txt
+          java -cp "$(cat classpath.txt)" org.openjdk.jmh.Main -l > out/benchmark-list.txt
+          python3 tools/case-study/check_benchmarks.py out/benchmark-list.txt ${{ matrix.pos }} ${{ matrix.sha }}
+      - name: Record all 16 benchmarks (about 25 minutes)
+        run: |
+          set -o pipefail
+          RE=$(python3 tools/case-study/pilot.py regex)
+          echo "measure_start=$(date +%s)" >> out/timing.txt
+          java -cp "$(cat classpath.txt)" org.openjdk.jmh.Main "$RE" $JMH_RECORD \
+            -rf json -rff out/jmh-record.json 2>&1 | tee out/jmh-record.log
+          echo "measure_end=$(date +%s)" >> out/timing.txt
+      - name: Check the recording and compute iteration means
+        run: |
+          set -o pipefail
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python3 tools/case-study/pilot.py record --json out/jmh-record.json \
+            --commit ${{ matrix.sha }} --pos ${{ matrix.pos }} --out out | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pilot-commit-${{ matrix.tag }}
+          path: out/
+          retention-days: 90
+          if-no-files-found: error
+
+  confirm:
+    needs: [test, record]
+    name: forced NASC (heapSort80, serialIndexOf250)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Start the clock
+        run: mkdir -p out && echo "job_start=$(date +%s)" > out/timing.txt
+      - name: Check out the case-study files
+        uses: actions/checkout@v7
+        with:
+          path: tools
+      - name: Check out jenetics at the parent (commit 1)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.test.outputs.parent }}
+          path: parent-src
+      - name: Check out jenetics at the candidate (commit 2)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.test.outputs.candidate }}
+          path: candidate-src
+      - name: Set up Java 8 (Temurin 8.0.514+1)
+        id: java1
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+      - name: Pause and clear the failed Java download
+        if: steps.java1.outcome == 'failure'
+        run: |
+          echo "First Java setup failed; waiting 60 s and retrying from scratch."
+          rm -rf "$RUNNER_TOOL_CACHE/Java_Temurin-Hotspot_jdk/8.0.514-1"
+          sleep 60
+      - name: Set up Java 8 (Temurin 8.0.514+1), second try
+        id: java2
+        if: steps.java1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+      - name: Stop if Java could not be set up
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome != 'success'
+        run: |
+          echo "::error title=Java setup failed twice::Temurin 8.0.514+1 could not be downloaded and verified. Re-run this job (Re-run failed jobs); do not change the JDK."
+          exit 1
+      - name: Check the JDK build
+        run: |
+          java -version 2>&1 | tee out/jdk.txt
+          grep -q "Temurin" out/jdk.txt && grep -q "1.8.0_514-b01" out/jdk.txt || {
+            echo "::error title=Wrong JDK::expected Temurin 1.8.0_514-b01"; exit 1; }
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install numpy
+        run: |
+          pip install numpy
+          pip freeze > out/python-packages.txt
+      - name: Build both JMH jars
+        run: |
+          for side in parent candidate; do
+            ( cd $side-src && chmod +x gradlew && ./gradlew --no-daemon --console=plain \
+                --init-script ../tools/case-study/print-jmh-classpath.gradle \
+                :jenetics:jmhJar :jenetics:printJmhClasspath )
+            JAR=$(ls $side-src/jenetics/build/libs/*-jmh.jar | head -1)
+            echo "$PWD/$JAR:$(cat $side-src/jenetics/build/jmh-classpath.txt)" > $side-classpath.txt
+          done
+      - name: Get the recordings of commits 1 and 2
+        uses: actions/download-artifact@v7
+        with:
+          pattern: pilot-commit-*
+          path: records
+      - name: Forced NASC and the report (about 5 to 10 minutes)
+        run: |
+          echo "measure_start=$(date +%s)" >> out/timing.txt
+          python3 tools/case-study/pilot.py confirm \
+            --parent records/pilot-commit-01 --candidate records/pilot-commit-02 \
+            --parent-cp parent-classpath.txt --candidate-cp candidate-classpath.txt \
+            --force heapSort80,serialIndexOf250 --out out \
+            --parent-timing records/pilot-commit-01/timing.txt \
+            --candidate-timing records/pilot-commit-02/timing.txt --timing out/timing.txt
+          cat out/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: pilot-results
+          path: out/
+          retention-days: 90
+          if-no-files-found: error

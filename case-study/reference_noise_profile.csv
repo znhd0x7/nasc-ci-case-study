@@ -1,0 +1,17 @@
+bench_id,short_id,versions,c_w_pct,c_t_pct,feasible,n_b,delta_feasible_pct
+io.jenetics.internal.util.IndexSorterPerf.heapSort80,IndexSorterPerf.heapSort80,19,1.458,0.0,True,3,1.52
+io.jenetics.internal.util.IndexSorterPerf.heapSort250,IndexSorterPerf.heapSort250,19,0.666,0.45,True,1,1.16
+io.jenetics.internal.util.IndexSorterPerf.heapSort320,IndexSorterPerf.heapSort320,19,0.67,0.274,True,1,0.9
+io.jenetics.PhenotypeEvaluationPerf.halfEvaluated,PhenotypeEvaluationPerf.halfEvaluated,4,1.141,0.0,True,2,1.19
+io.jenetics.PhenotypeEvaluationPerf.unevaluated,PhenotypeEvaluationPerf.unevaluated,4,0.856,0.596,True,2,1.53
+io.jenetics.ProbabilitySelectorIndexOfPerf.serialIndexOf250,ProbabilitySelectorIndexOfPerf.serialIndexOf250,21,1.564,0.512,True,4,1.95
+io.jenetics.util.RandomEnginePerf.RandomPerf.nextDouble,RandomPerf.nextDouble,19,0.675,0.683,True,1,1.59
+io.jenetics.util.RandomEnginePerf.RandomPerf.nextLong,RandomPerf.nextLong,19,0.682,0.76,True,2,1.73
+io.jenetics.util.SeqPerf.arrayList_contains,SeqPerf.arrayList_contains,15,0.17,0.0,True,1,0.18
+io.jenetics.util.SeqPerf.arrayList_forEachLoop,SeqPerf.arrayList_forEachLoop,15,0.797,0.382,True,1,1.15
+io.jenetics.util.SeqPerf.arrayList_forLoop,SeqPerf.arrayList_forLoop,15,0.117,0.03,True,1,0.14
+io.jenetics.util.SeqPerf.arrayList_get,SeqPerf.arrayList_get,15,0.099,0.027,True,1,0.12
+io.jenetics.util.SeqPerf.mseq_contains,SeqPerf.mseq_contains,15,0.194,0.211,True,1,0.48
+io.jenetics.util.SeqPerf.mseq_forEachLoop,SeqPerf.mseq_forEachLoop,15,0.45,0.321,True,1,0.81
+io.jenetics.util.SeqPerf.mseq_forLoop,SeqPerf.mseq_forLoop,15,0.124,0.0,True,1,0.13
+io.jenetics.util.SeqPerf.mseq_get,SeqPerf.mseq_get,15,0.105,0.039,True,1,0.14
