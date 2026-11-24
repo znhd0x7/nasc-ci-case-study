@@ -1,9 +1,12 @@
-# build-check v2 (24 Nov 2026). Build check (no measurement): for each studied commit, build the JMH
+# build-check v3 (24 Nov 2026). Build check (no measurement): for each studied commit, build the JMH
 # benchmarks on Java 8 and check that all 16 case-study benchmarks are there.
 # Started by hand (Actions tab > build-check > Run workflow).
 # v2: the 2019 jmhJar does not contain JMH itself (plugin 0.4.5 packs no jmh-core), so JMH runs from
 # the class path Gradle resolves, written by case-study/print-jmh-classpath.gradle (an init script
-# applied from outside; no jenetics file is changed). Java setup is retried once.
+# applied from outside; no jenetics file is changed).
+# v3: Java is pinned to Temurin 8.0.514+1 (1.8.0_514-b01), the build all studied runs must use.
+# A failed download is retried once after a pause, from scratch, with checksum verification kept on;
+# if both fail the job stops with a clear error (it never falls back to another JDK).
 name: build-check
 
 on:
@@ -48,20 +51,37 @@ jobs:
         with:
           ref: ${{ matrix.sha }}
           path: jenetics-src
-      - name: Set up Java 8 (Temurin)
+      - name: Set up Java 8 (Temurin 8.0.514+1)
         id: java1
         continue-on-error: true
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: "8"
-      - name: Set up Java 8 (Temurin), second try
+          java-version: "8.0.514+1"
+      - name: Pause and clear the failed Java download
         if: steps.java1.outcome == 'failure'
+        run: |
+          echo "First Java setup failed; waiting 60 s and retrying from scratch."
+          rm -rf "$RUNNER_TOOL_CACHE/Java_Temurin-Hotspot_jdk/8.0.514-1"
+          sleep 60
+      - name: Set up Java 8 (Temurin 8.0.514+1), second try
+        id: java2
+        if: steps.java1.outcome == 'failure'
+        continue-on-error: true
         uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: "8"
-          check-latest: true
+          java-version: "8.0.514+1"
+      - name: Stop if Java could not be set up
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome != 'success'
+        run: |
+          echo "::error title=Java setup failed twice::Temurin 8.0.514+1 could not be downloaded and verified. Re-run this job (Re-run failed jobs); do not change the JDK."
+          exit 1
+      - name: Check the JDK build
+        run: |
+          java -version 2>&1 | tee jdk.txt
+          grep -q "Temurin" jdk.txt && grep -q "1.8.0_514-b01" jdk.txt || {
+            echo "::error title=Wrong JDK::expected Temurin 1.8.0_514-b01"; exit 1; }
       - name: Build the JMH jar
         working-directory: jenetics-src
         run: |
