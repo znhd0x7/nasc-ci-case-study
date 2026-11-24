@@ -1,0 +1,17 @@
+# The 16 benchmarks of the case study: feasible in the reference noise profile and present in every studied commit.
+io.jenetics.internal.util.IndexSorterPerf.heapSort80
+io.jenetics.internal.util.IndexSorterPerf.heapSort250
+io.jenetics.internal.util.IndexSorterPerf.heapSort320
+io.jenetics.PhenotypeEvaluationPerf.halfEvaluated
+io.jenetics.PhenotypeEvaluationPerf.unevaluated
+io.jenetics.ProbabilitySelectorIndexOfPerf.serialIndexOf250
+io.jenetics.util.RandomEnginePerf.RandomPerf.nextDouble
+io.jenetics.util.RandomEnginePerf.RandomPerf.nextLong
+io.jenetics.util.SeqPerf.arrayList_contains
+io.jenetics.util.SeqPerf.arrayList_forEachLoop
+io.jenetics.util.SeqPerf.arrayList_forLoop
+io.jenetics.util.SeqPerf.arrayList_get
+io.jenetics.util.SeqPerf.mseq_contains
+io.jenetics.util.SeqPerf.mseq_forEachLoop
+io.jenetics.util.SeqPerf.mseq_forLoop
+io.jenetics.util.SeqPerf.mseq_get

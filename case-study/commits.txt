@@ -1,0 +1,17 @@
+# The 15 consecutive commits of the case study (first-parent history of jenetics v4.4.0, oldest first).
+# position  sha (full, as actions/checkout needs)  date  message
+1  42db904437979315eaf0670d895dbfad7ca54b81  2019-02-08  Merge PR #444 precondition checks
+2  44ccb482c818630b5f475796aab1bbe4ce47af2c  2019-02-08  Update version string to '4.4'
+3  827785fd74238bd1ca892cfbfe815c8740796a17  2019-02-09  Fix Javadoc
+4  29fd80f6f6205462be64950bfb892fc3637b2174  2019-02-12  Merge PR #446 phenotype deprecation
+5  9d82354b6bc7c74655aa7468da9815d37ab8d8ba  2019-02-18  Merge PR #458 Seq.toArray
+6  25be4db3b66fbafe32b99a7a176420073ac76a26  2019-02-18  Merge PR #459 extendable alterer
+7  2bd25742df2a8705f2b2907d2e0b441c8f05f68d  2019-02-18  Merge PR #460 gradle build
+8  229eb261075b3ee380f931df83d1ec4b14eded8f  2019-02-18  Update Gradle version
+9  ec7d2d4289e8b64048efdd5bbb5c3b2f0562c2e4  2019-02-18  Replace version placeholder with '4.4'
+10 8af8db0311a907502304a35f7de5bff5453b58cb  2019-02-18  Merge origin/master into r4.4.0
+11 7f08fb2fc571753012b0d3b5937fe9f69c707011  2019-02-18  Update JPX version to 1.4.0
+12 ad657804ad76ffd8b04c40475e47f4fbfb532a2b  2019-02-18  Add release notes
+13 53b19e84d7bbe3f3ed5c9e55ed3124237adc7b68  2019-02-18  Add changelog
+14 f4665e1aad0b9d489a125027ddb51d3e5f241dbe  2019-02-18  Remove SNAPSHOT from version string
+15 4b3833dc1272d2afbc033681197455b6021b1183  2019-02-18  Fix project packaging

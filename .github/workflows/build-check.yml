@@ -1,0 +1,70 @@
+# Build check (no measurement): for each studied commit, build the JMH jar on Java 8 and check that
+# all 16 case-study benchmarks are in it. Started by hand (Actions tab > build-check > Run workflow).
+name: build-check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    outputs:
+      commits: ${{ steps.read.outputs.commits }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: read
+        name: Read case-study/commits.txt
+        run: |
+          python3 -c "
+          import json
+          rows = [l.split()[:2] for l in open('case-study/commits.txt') if l.strip() and not l.startswith('#')]
+          print('commits=' + json.dumps([{'pos': int(p), 'sha': s} for p, s in rows]))
+          " >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  build:
+    needs: list
+    name: build ${{ matrix.pos }} (${{ matrix.sha }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.list.outputs.commits) }}
+    steps:
+      - name: Check out the case-study files
+        uses: actions/checkout@v7
+        with:
+          path: tools
+      - name: Check out jenetics at the studied commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.sha }}
+          path: jenetics-src
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8"
+      - name: Build the JMH jar
+        working-directory: jenetics-src
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon --console=plain :jenetics:jmhJar
+      - name: List and check the benchmarks
+        run: |
+          JAR=$(ls jenetics-src/jenetics/build/libs/*-jmh.jar | head -1)
+          echo "JMH jar: $JAR"
+          java -version
+          java -jar "$JAR" -l > benchmarks-${{ matrix.pos }}.txt
+          echo "| Pos | Commit | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          python3 tools/case-study/check_benchmarks.py benchmarks-${{ matrix.pos }}.txt ${{ matrix.pos }} ${{ matrix.sha }} | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: benchmark-list-${{ matrix.pos }}
+          path: benchmarks-${{ matrix.pos }}.txt
+          if-no-files-found: ignore
