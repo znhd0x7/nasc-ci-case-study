@@ -1,5 +1,9 @@
-# Build check (no measurement): for each studied commit, build the JMH jar on Java 8 and check that
-# all 16 case-study benchmarks are in it. Started by hand (Actions tab > build-check > Run workflow).
+# build-check v2 (24 Nov 2026). Build check (no measurement): for each studied commit, build the JMH
+# benchmarks on Java 8 and check that all 16 case-study benchmarks are there.
+# Started by hand (Actions tab > build-check > Run workflow).
+# v2: the 2019 jmhJar does not contain JMH itself (plugin 0.4.5 packs no jmh-core), so JMH runs from
+# the class path Gradle resolves, written by case-study/print-jmh-classpath.gradle (an init script
+# applied from outside; no jenetics file is changed). Java setup is retried once.
 name: build-check
 
 on:
@@ -44,24 +48,39 @@ jobs:
         with:
           ref: ${{ matrix.sha }}
           path: jenetics-src
-      - uses: actions/setup-java@v6
+      - name: Set up Java 8 (Temurin)
+        id: java1
+        continue-on-error: true
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "8"
+      - name: Set up Java 8 (Temurin), second try
+        if: steps.java1.outcome == 'failure'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8"
+          check-latest: true
       - name: Build the JMH jar
         working-directory: jenetics-src
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon --console=plain :jenetics:jmhJar
+          ./gradlew --no-daemon --console=plain \
+            --init-script ../tools/case-study/print-jmh-classpath.gradle \
+            :jenetics:jmhJar :jenetics:printJmhClasspath
       - name: List and check the benchmarks
         run: |
           JAR=$(ls jenetics-src/jenetics/build/libs/*-jmh.jar | head -1)
+          CP="$JAR:$(cat jenetics-src/jenetics/build/jmh-classpath.txt)"
           echo "JMH jar: $JAR"
+          echo "Class path jars: $(echo "$CP" | tr ':' '\n' | grep '\.jar$' | sed 's|.*/||' | tr '\n' ' ')"
           java -version
-          java -jar "$JAR" -l > benchmarks-${{ matrix.pos }}.txt
+          java -cp "$CP" org.openjdk.jmh.Main -l > benchmarks-${{ matrix.pos }}.txt
           echo "| Pos | Commit | Result |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
           python3 tools/case-study/check_benchmarks.py benchmarks-${{ matrix.pos }}.txt ${{ matrix.pos }} ${{ matrix.sha }} | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Java: $(java -version 2>&1 | head -2 | tail -1)" >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

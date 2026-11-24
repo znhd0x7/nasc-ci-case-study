@@ -1,0 +1,16 @@
+// print-jmh-classpath v1 (24 Nov 2026)
+// Init script (applied from outside the jenetics sources): writes the JMH runtime class path of
+// :jenetics to build/jmh-classpath.txt. It changes no jenetics file.
+allprojects {
+    afterEvaluate { p ->
+        if (p.path == ':jenetics') {
+            p.tasks.create('printJmhClasspath') {
+                doLast {
+                    def cp = p.sourceSets.jmh.runtimeClasspath.files.findAll { it.exists() }
+                    p.file("${p.buildDir}/jmh-classpath.txt").text = cp.join(File.pathSeparator)
+                    println "JMH class path: ${cp.size()} entries"
+                }
+            }
+        }
+    }
+}
