@@ -9,6 +9,8 @@ real benchmark results instead of simulated series:
   history.py    the JSON history store
   runner.py     re-runs a benchmark for a confirmation batch (any shell command)
   check.py      one CI check: detect, confirm, store, report
+  machine.py    which machine a job ran on (CPU model, clock source)          (v0.3)
+  codehash.py   hash of a commit's compiled classes                            (v0.3)
 """
 
-VERSION = "nasc-ci 0.2 (24 Nov 2026)"
+VERSION = "nasc-ci 0.3 (24 Nov 2026)"

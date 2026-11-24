@@ -6,8 +6,12 @@
   "versions": [{"index": 1, "commit": "a1b2c3", "label": "v01", "time": "...",
                 "results": {benchmark: {"runs": [[blocks]], "unit": "ns/op"}}}, ...],
   "checks":   [{"version": 6, "benchmark": "...", "decision": "confirmed", ...}, ...],
-  "baselines": {benchmark: first version index of the current baseline}
+  "baselines": {benchmark: first version index of the current baseline},
+  "profile":  {"versions": [1, 2, 3, 4, 5], "benchmarks": {benchmark: Noise}, "cpus": [...],
+               "mixed_cpu": false}       (v0.3: frozen noise profile, written after version N)
 }
+Version entries may also hold "machine" (CPU model etc., see machine.py) and "code" (hash of the
+compiled classes, see codehash.py).
 When a slowdown is confirmed, the confirmed version becomes the new baseline (triage accepts it,
 as in nasc_sim.check_series), so later versions are compared with the new level.
 """
@@ -35,6 +39,11 @@ DEFAULT_SETTINGS = {
     "noise_min_versions": 3,      # versions needed before c_w and c_t are estimated
     "default_c_w": 0.01,          # used until then
     "default_c_t": 0.01,
+    # v0.3 (24 Nov 2026)
+    "scale": "fresh",             # y_k divided by the mean of this confirmation's own reference runs
+                                  # ("stored" = by the level passed in: true level in the simulation)
+    "order": "abba",              # candidate/reference order alternates per batch ("fixed" = always candidate first)
+    "profile_versions": 5,        # c_w, c_t estimated from the first N stored versions, then frozen (0 = never frozen)
 }
 
 

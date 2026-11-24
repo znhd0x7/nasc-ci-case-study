@@ -1,0 +1,185 @@
+# ab-check v1 (24 Nov 2026). Same-VM A/B check, started by hand (Actions tab > ab-check > Run workflow).
+#   test  the unit tests and the NASC-CI version stamp, before any runner time is spent on JMH;
+#         reads the two commits from case-study/commits.txt (default positions 1 and 2)
+#   ab    ONE job (one VM) builds both commits and runs case-study/ab_check.py: for each benchmark
+#         (default heapSort80 and serialIndexOf250) 10 pairs of back-to-back runs of commit B and
+#         commit A, in NASC-CI 0.3's ABBA order (odd pairs B first, even pairs A first), benchmarks
+#         taking turns. Every run: JMH -bm sample -tu ns -f 1 -wi 10 -i 20 -w 1s -r 1s -foe true.
+#         The report gives B vs A for "candidate first" and "reference first" separately, the
+#         order-balanced difference, the order effect and the same-VM noise (c_w, c_t).
+#         CPU model (nasc_ci machine + lscpu) and the compiled-code hash of both commits are logged.
+# Expected: 40 runs x about 31 s = about 21 minutes of measuring; about 25 runner minutes in all.
+# Java is Temurin 8.0.514+1 (1.8.0_514-b01), set up exactly as in build-check v3 and pilot v1:
+# checksum verification on, one retry after a pause, a clear stop if both fail, never another JDK.
+# The artifact is kept 90 days; copy it into the private results folder before then.
+name: ab-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      a:
+        description: "Position of commit A, the reference (case-study/commits.txt)"
+        default: "1"
+      b:
+        description: "Position of commit B, the candidate"
+        default: "2"
+      benchmarks:
+        description: "Benchmarks (short names, comma-separated)"
+        default: "heapSort80,serialIndexOf250"
+      pairs:
+        description: "Pairs per benchmark (even, so both orders get the same number)"
+        default: "10"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: measurements
+  cancel-in-progress: false
+
+env:
+  POS_A: ${{ inputs.a }}
+  POS_B: ${{ inputs.b }}
+  BENCHMARKS: ${{ inputs.benchmarks }}
+  PAIRS: ${{ inputs.pairs }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha_a: ${{ steps.read.outputs.sha_a }}
+      sha_b: ${{ steps.read.outputs.sha_b }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Unit tests
+        run: |
+          pip install numpy pandas pytest
+          python -m pytest -q tests
+      - name: Check the NASC-CI version stamp
+        run: |
+          python -c "import nasc_ci; print(nasc_ci.VERSION)"
+          grep -Eq '^[0-9a-f]{40}$' nasc_ci/VERSION || { echo "::error title=No version stamp::nasc_ci/VERSION must hold one 40-character commit hash"; exit 1; }
+          echo "NASC-CI source: $(cat nasc_ci/VERSION)"
+      - id: read
+        name: Check the inputs and pick the two commits
+        run: |
+          python3 -c "
+          import os, re, sys
+          a, b, pairs = os.environ['POS_A'], os.environ['POS_B'], os.environ['PAIRS']
+          if not (a.isdigit() and b.isdigit() and a != b):
+              sys.exit('::error::positions must be two different numbers')
+          if not (pairs.isdigit() and int(pairs) >= 2 and int(pairs) % 2 == 0):
+              sys.exit('::error::pairs must be an even number, 2 or more')
+          if not re.fullmatch(r'[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*', os.environ['BENCHMARKS']):
+              sys.exit('::error::benchmarks must be short names separated by commas')
+          rows = {p: s for p, s in (l.split()[:2] for l in open('case-study/commits.txt') if l.strip() and not l.startswith('#'))}
+          for side, pos in (('a', a), ('b', b)):
+              if pos not in rows:
+                  sys.exit(f'::error::position {pos} is not in case-study/commits.txt')
+              print(f'sha_{side}={rows[pos]}')
+          " >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  ab:
+    needs: test
+    name: A/B commit ${{ inputs.a }} vs ${{ inputs.b }} on one VM
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Start the clock
+        run: mkdir -p out && echo "job_start=$(date +%s)" > out/timing.txt
+      - name: Check out the case-study files
+        uses: actions/checkout@v7
+        with:
+          path: tools
+      - name: Check out jenetics at commit A (reference)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.test.outputs.sha_a }}
+          path: a-src
+      - name: Check out jenetics at commit B (candidate)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.test.outputs.sha_b }}
+          path: b-src
+      - name: Set up Java 8 (Temurin 8.0.514+1)
+        id: java1
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+      - name: Pause and clear the failed Java download
+        if: steps.java1.outcome == 'failure'
+        run: |
+          echo "First Java setup failed; waiting 60 s and retrying from scratch."
+          rm -rf "$RUNNER_TOOL_CACHE/Java_Temurin-Hotspot_jdk/8.0.514-1"
+          sleep 60
+      - name: Set up Java 8 (Temurin 8.0.514+1), second try
+        id: java2
+        if: steps.java1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+      - name: Stop if Java could not be set up
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome != 'success'
+        run: |
+          echo "::error title=Java setup failed twice::Temurin 8.0.514+1 could not be downloaded and verified. Re-run this job (Re-run failed jobs); do not change the JDK."
+          exit 1
+      - name: Check the JDK build
+        run: |
+          java -version 2>&1 | tee out/jdk.txt
+          grep -q "Temurin" out/jdk.txt && grep -q "1.8.0_514-b01" out/jdk.txt || {
+            echo "::error title=Wrong JDK::expected Temurin 1.8.0_514-b01"; exit 1; }
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install numpy
+        run: |
+          pip install numpy
+          pip freeze > out/python-packages.txt
+      - name: Log the CPU model of this VM
+        working-directory: tools
+        run: |
+          python3 -m nasc_ci machine --out ../out/machine.json
+          lscpu > ../out/lscpu.txt
+          grep -m1 "model name" /proc/cpuinfo
+      - name: Build both JMH jars
+        run: |
+          for side in a b; do
+            ( cd $side-src && chmod +x gradlew && ./gradlew --no-daemon --console=plain \
+                --init-script ../tools/case-study/print-jmh-classpath.gradle \
+                :jenetics:jmhJar :jenetics:printJmhClasspath )
+            JAR=$(ls $side-src/jenetics/build/libs/*-jmh.jar | head -1)
+            echo "$PWD/$JAR:$(cat $side-src/jenetics/build/jmh-classpath.txt)" > $side-classpath.txt
+          done
+      - name: Hash the compiled code of both commits
+        working-directory: tools
+        run: |
+          for side in a b; do
+            python3 -m nasc_ci codehash ../$side-src/jenetics/build/classes/java/main \
+              ../$side-src/jenetics/build/classes/java/jmh --out ../out/code-$side.json
+          done
+      - name: A/B runs and the report (about 21 minutes)
+        run: |
+          set -o pipefail
+          python3 tools/case-study/ab_check.py run \
+            --a ${{ needs.test.outputs.sha_a }} --b ${{ needs.test.outputs.sha_b }} \
+            --a-pos "$POS_A" --b-pos "$POS_B" --a-cp a-classpath.txt --b-cp b-classpath.txt \
+            --bench "$BENCHMARKS" --pairs "$PAIRS" --out out \
+            --machine out/machine.json --code-a out/code-a.json --code-b out/code-b.json \
+            --timing out/timing.txt 2>&1 | tee out/ab-check.log
+          cat out/report.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ab-check-results
+          path: out/
+          retention-days: 90
+          if-no-files-found: error

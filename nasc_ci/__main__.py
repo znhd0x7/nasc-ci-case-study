@@ -4,14 +4,20 @@
   --no-save            check only, do not store the version (pull requests: compare, don't record)
   --fail-on-confirmed  exit with code 1 when a slowdown is confirmed (to fail the CI job)
   --set key=value      change a setting, e.g. --set detector=bootstrap --set ttest_tau=3
+  --machine auto|none|FILE   machine that recorded the results (default auto: this machine)
+  --code FILE          compiled-code hash of the commit (JSON written by the codehash command)
+
+                 python -m nasc_ci machine [--out machine.json]
+                 python -m nasc_ci codehash DIR [DIR ...] [--out code.json]
 """
 
 import argparse
+import json
 import sys
 
 import numpy as np
 
-from . import VERSION, history, jmh
+from . import VERSION, codehash, history, jmh, machine
 from .check import report, run_check
 from .runner import CommandRunner
 
@@ -40,7 +46,22 @@ def main(argv=None):
     c.add_argument("--seed", type=int, default=None)
     c.add_argument("--set", action="append", default=[], metavar="KEY=VALUE")
     c.add_argument("--quiet", action="store_true", help="do not print the report")
+    c.add_argument("--machine", default="auto", help="auto, none, or a JSON file from the machine command")
+    c.add_argument("--code", help="JSON file from the codehash command")
+    m = sub.add_parser("machine", help="print this machine's CPU model etc. as JSON")
+    m.add_argument("--out")
+    ch = sub.add_parser("codehash", help="hash of the compiled classes under the given folders")
+    ch.add_argument("folders", nargs="+")
+    ch.add_argument("--out")
     a = p.parse_args(argv)
+    if a.command in ("machine", "codehash"):
+        info = machine.describe() if a.command == "machine" else codehash.code_hash(a.folders)
+        text = json.dumps(info, indent=1)
+        print(text)
+        if a.out:
+            with open(a.out, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+        return 0
     if hasattr(sys.stdout, "reconfigure"):          # the report has emoji; never crash on a Windows console
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -50,7 +71,19 @@ def main(argv=None):
     results = jmh.read(a.results)
     label = a.label or a.commit[:7]
     runner = CommandRunner(a.rerun_cmd)
-    rows = run_check(h, results, a.commit, label, runner, np.random.default_rng(a.seed), save=not a.no_save)
+    if a.machine == "auto":
+        machine_info = machine.describe()
+    elif a.machine == "none":
+        machine_info = None
+    else:
+        with open(a.machine, encoding="utf-8") as f:
+            machine_info = json.load(f)
+    code = None
+    if a.code:
+        with open(a.code, encoding="utf-8") as f:
+            code = json.load(f)
+    rows = run_check(h, results, a.commit, label, runner, np.random.default_rng(a.seed), save=not a.no_save,
+                     machine_info=machine_info, code=code)
     text = report(rows, h, a.commit, label)
     if not a.quiet:
         print(text)
