@@ -7,7 +7,8 @@
 #            of commit 2: candidate and parent re-measured back to back in this one job; then the
 #            report (job summary + report.md), pilot.json and history.json
 # Java is Temurin 8.0.514+1 (1.8.0_514-b01) in every job, set up exactly as in build-check v3:
-# checksum verification on, one retry after a pause, a clear stop if both fail, never another JDK.
+# checksum verification on, two retries (after 60 s and 180 s), the verified JDK cached (cache-jdk),
+# a clear stop if all three fail, never another JDK (Java setup v2, 25 Nov 2026).
 # Every artifact is kept 90 days; copy them into the private results folder before then.
 name: pilot
 
@@ -79,6 +80,10 @@ jobs:
         with:
           ref: ${{ matrix.sha }}
           path: jenetics-src
+      # Java setup v2 (25 Nov 2026): cache-jdk keeps the verified JDK in the GitHub cache under a key made of the
+      # exact version and Adoptium's expected sha256, so later jobs restore it instead of downloading;
+      # it is saved only after a download that passed the checksum, and only if the job succeeds.
+      # A failed download is retried twice: after 60 s and after another 180 s.
       - name: Set up Java 8 (Temurin 8.0.514+1)
         id: java1
         continue-on-error: true
@@ -86,6 +91,7 @@ jobs:
         with:
           distribution: temurin
           java-version: "8.0.514+1"
+          cache-jdk: true
       - name: Pause and clear the failed Java download
         if: steps.java1.outcome == 'failure'
         run: |
@@ -100,10 +106,26 @@ jobs:
         with:
           distribution: temurin
           java-version: "8.0.514+1"
-      - name: Stop if Java could not be set up
-        if: steps.java1.outcome == 'failure' && steps.java2.outcome != 'success'
+          cache-jdk: true
+      - name: Pause longer and clear the failed Java download
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome == 'failure'
         run: |
-          echo "::error title=Java setup failed twice::Temurin 8.0.514+1 could not be downloaded and verified. Re-run this job (Re-run failed jobs); do not change the JDK."
+          echo "Second Java setup failed; waiting 180 s and retrying from scratch."
+          rm -rf "$RUNNER_TOOL_CACHE/Java_Temurin-Hotspot_jdk/8.0.514-1"
+          sleep 180
+      - name: Set up Java 8 (Temurin 8.0.514+1), third try
+        id: java3
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+          cache-jdk: true
+      - name: Stop if Java could not be set up
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome != 'success' && steps.java3.outcome != 'success'
+        run: |
+          echo "::error title=Java setup failed three times::Temurin 8.0.514+1 could not be downloaded and verified. Re-run this job (Re-run failed jobs); do not change the JDK."
           exit 1
       - name: Check the JDK build
         run: |
@@ -175,6 +197,10 @@ jobs:
         with:
           ref: ${{ needs.test.outputs.candidate }}
           path: candidate-src
+      # Java setup v2 (25 Nov 2026): cache-jdk keeps the verified JDK in the GitHub cache under a key made of the
+      # exact version and Adoptium's expected sha256, so later jobs restore it instead of downloading;
+      # it is saved only after a download that passed the checksum, and only if the job succeeds.
+      # A failed download is retried twice: after 60 s and after another 180 s.
       - name: Set up Java 8 (Temurin 8.0.514+1)
         id: java1
         continue-on-error: true
@@ -182,6 +208,7 @@ jobs:
         with:
           distribution: temurin
           java-version: "8.0.514+1"
+          cache-jdk: true
       - name: Pause and clear the failed Java download
         if: steps.java1.outcome == 'failure'
         run: |
@@ -196,10 +223,26 @@ jobs:
         with:
           distribution: temurin
           java-version: "8.0.514+1"
-      - name: Stop if Java could not be set up
-        if: steps.java1.outcome == 'failure' && steps.java2.outcome != 'success'
+          cache-jdk: true
+      - name: Pause longer and clear the failed Java download
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome == 'failure'
         run: |
-          echo "::error title=Java setup failed twice::Temurin 8.0.514+1 could not be downloaded and verified. Re-run this job (Re-run failed jobs); do not change the JDK."
+          echo "Second Java setup failed; waiting 180 s and retrying from scratch."
+          rm -rf "$RUNNER_TOOL_CACHE/Java_Temurin-Hotspot_jdk/8.0.514-1"
+          sleep 180
+      - name: Set up Java 8 (Temurin 8.0.514+1), third try
+        id: java3
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+          cache-jdk: true
+      - name: Stop if Java could not be set up
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome != 'success' && steps.java3.outcome != 'success'
+        run: |
+          echo "::error title=Java setup failed three times::Temurin 8.0.514+1 could not be downloaded and verified. Re-run this job (Re-run failed jobs); do not change the JDK."
           exit 1
       - name: Check the JDK build
         run: |
