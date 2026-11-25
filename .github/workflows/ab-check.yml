@@ -1,4 +1,11 @@
-# ab-check v1 (24 Nov 2026). Same-VM A/B check, started by hand (Actions tab > ab-check > Run workflow).
+# ab-check v2 (25 Nov 2026). Same-VM A/B check, started by hand (Actions tab > ab-check > Run workflow).
+# v2 (25 Nov 2026): optional input "patch" (heapsort or indexof) applies an injection patch from
+#   case-study/injections/ to commit B only, so A and B may be the same commit (clean vs injected).
+#   The patch is applied with "git apply --check" first, copied into the artifact with its sha256,
+#   and the report gives the injected slowdown labelled with the CPU model it was measured on.
+#   Calibration runs: a=9, b=9, patch=heapsort, benchmarks=heapSort80,heapSort250,heapSort320
+#   (60 runs, about 31 min of measuring); a=13, b=13, patch=indexof, benchmarks=serialIndexOf250
+#   (20 runs, about 10 min).
 #   test  the unit tests and the NASC-CI version stamp, before any runner time is spent on JMH;
 #         reads the two commits from case-study/commits.txt (default positions 1 and 2)
 #   ab    ONE job (one VM) builds both commits and runs case-study/ab_check.py: for each benchmark
@@ -30,6 +37,11 @@ on:
       pairs:
         description: "Pairs per benchmark (even, so both orders get the same number)"
         default: "10"
+      patch:
+        description: "Injection patch applied to commit B only (case-study/injections/<name>.patch)"
+        type: choice
+        options: [none, heapsort, indexof]
+        default: none
 
 permissions:
   contents: read
@@ -43,6 +55,7 @@ env:
   POS_B: ${{ inputs.b }}
   BENCHMARKS: ${{ inputs.benchmarks }}
   PAIRS: ${{ inputs.pairs }}
+  PATCH: ${{ inputs.patch }}
 
 jobs:
   test:
@@ -70,9 +83,15 @@ jobs:
         run: |
           python3 -c "
           import os, re, sys
-          a, b, pairs = os.environ['POS_A'], os.environ['POS_B'], os.environ['PAIRS']
-          if not (a.isdigit() and b.isdigit() and a != b):
-              sys.exit('::error::positions must be two different numbers')
+          a, b, pairs, patch = os.environ['POS_A'], os.environ['POS_B'], os.environ['PAIRS'], os.environ['PATCH']
+          if not (a.isdigit() and b.isdigit()):
+              sys.exit('::error::positions must be numbers')
+          if patch not in ('none', 'heapsort', 'indexof'):
+              sys.exit('::error::patch must be none, heapsort or indexof')
+          if a == b and patch == 'none':
+              sys.exit('::error::A and B may be the same commit only when a patch is applied to B')
+          if patch != 'none' and not os.path.isfile(f'case-study/injections/{patch}.patch'):
+              sys.exit(f'::error::case-study/injections/{patch}.patch is missing')
           if not (pairs.isdigit() and int(pairs) >= 2 and int(pairs) % 2 == 0):
               sys.exit('::error::pairs must be an even number, 2 or more')
           if not re.fullmatch(r'[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*', os.environ['BENCHMARKS']):
@@ -87,7 +106,7 @@ jobs:
 
   ab:
     needs: test
-    name: A/B commit ${{ inputs.a }} vs ${{ inputs.b }} on one VM
+    name: A/B commit ${{ inputs.a }} vs ${{ inputs.b }}${{ inputs.patch != 'none' && format(' + {0} patch', inputs.patch) || '' }} on one VM
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
@@ -107,6 +126,15 @@ jobs:
         with:
           ref: ${{ needs.test.outputs.sha_b }}
           path: b-src
+      - name: Apply the injection patch to commit B
+        if: inputs.patch != 'none'
+        run: |
+          P="$PWD/tools/case-study/injections/$PATCH.patch"
+          git -C b-src apply --check "$P"
+          git -C b-src apply "$P"
+          git -C b-src diff --stat
+          cp "$P" out/
+          sha256sum "$P" | sed 's|  .*/|  |' | tee out/patch-sha256.txt
       # Java setup v2 (25 Nov 2026): cache-jdk keeps the verified JDK in the GitHub cache under a key made of the
       # exact version and Adoptium's expected sha256, so later jobs restore it instead of downloading;
       # it is saved only after a download that passed the checksum, and only if the job succeeds.
@@ -188,15 +216,17 @@ jobs:
             python3 -m nasc_ci codehash ../$side-src/jenetics/build/classes/java/main \
               ../$side-src/jenetics/build/classes/java/jmh --out ../out/code-$side.json
           done
-      - name: A/B runs and the report (about 21 minutes)
+      - name: A/B runs and the report (about 10 to 31 minutes, see the header)
         run: |
           set -o pipefail
+          PATCH_ARG=()
+          if [ "$PATCH" != "none" ]; then PATCH_ARG=(--b-patch "tools/case-study/injections/$PATCH.patch"); fi
           python3 tools/case-study/ab_check.py run \
             --a ${{ needs.test.outputs.sha_a }} --b ${{ needs.test.outputs.sha_b }} \
             --a-pos "$POS_A" --b-pos "$POS_B" --a-cp a-classpath.txt --b-cp b-classpath.txt \
             --bench "$BENCHMARKS" --pairs "$PAIRS" --out out \
             --machine out/machine.json --code-a out/code-a.json --code-b out/code-b.json \
-            --timing out/timing.txt 2>&1 | tee out/ab-check.log
+            --timing out/timing.txt "${PATCH_ARG[@]}" 2>&1 | tee out/ab-check.log
           cat out/report.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()

@@ -1,4 +1,7 @@
-"""Tests of case-study/ab_check.py v1 (24 Nov 2026) with a fake machine, no Java needed.
+"""Tests of case-study/ab_check.py v2 (25 Nov 2026) with a fake machine, no Java needed.
+
+v2 (25 Nov 2026): the injection patch on B is recorded and its slowdown is reported with the CPU
+model it was measured on; the two patch files in case-study/injections/ are checked as text.
 
 The fake machine makes whichever run of a pair goes FIRST slower by a fixed share (an order
 effect), and B slower than A by a chosen true change. The check must split the two: the
@@ -114,3 +117,52 @@ def test_full_names_and_report():
     assert "**identical**" in text and "Test CPU" in text
     assert "`IndexSorterPerf.heapSort80`" in text and "`ProbabilitySelectorIndexOfPerf.serialIndexOf250`" in text
     assert text.count("ᶜ") == 10 + 1 and text.count("ʳ") == 10 + 1             # 5 + 5 per benchmark, + legend
+
+
+def report_input(res, patch=None, same_code=True):
+    return {"ab": ab.AB, "tool": ab.VERSION, "nasc_ci_source": "0" * 40, "a": {"pos": 9},
+            "b": {"pos": 9, "patch": patch}, "pairs": 10,
+            "machine": {"cpu_model": "Test CPU", "cpus": 4, "clocksource": "tsc"},
+            "code_A": {"sha256": "ab" * 32}, "code_B": {"sha256": ("ab" if same_code else "cd") * 32},
+            "same_code": same_code, "minutes": {"setup_build": 2.0, "measure": 30.0, "total": 32.0},
+            "results": list(res.values())}
+
+
+def test_injection_patch_is_recorded_and_its_size_reported_with_the_cpu():
+    path = ROOT / "case-study" / "injections" / "heapsort.patch"
+    info = ab.patch_info(str(path))
+    assert info["file"] == "heapsort.patch" and len(info["sha256"]) == 64
+    assert info["added"] > 0 and info["removed"] == 0
+    assert ab.patch_info(None) is None
+    res, _, _ = summarise(true_change=0.05, first_penalty=0.0)
+    text = ab.report(report_input(res, info, same_code=False))
+    assert "commit 9 (A) vs commit 9 + `heapsort.patch` (B)" in text
+    assert "### Injected slowdown, measured on Test CPU (4 CPUs)" in text
+    assert "may differ on other CPU types" in text
+    assert "expected: B carries the injection patch" in text
+    assert "+5." in text.split("### Injected slowdown")[1]           # about +5 %
+    warn = ab.report(report_input(res, info, same_code=True))
+    assert "the patch did not reach the compiled code" in warn
+
+
+def test_report_without_patch_has_no_injection_section():
+    res, _, _ = summarise(true_change=0.0, first_penalty=0.0)
+    text = ab.report(report_input(res))
+    assert "Injected slowdown" not in text and "Injection patch" not in text
+    assert "**identical**" in text
+
+
+@pytest.mark.parametrize("name, java_file", [
+    ("heapsort.patch", "jenetics/src/main/java/io/jenetics/internal/util/IndexSorter.java"),
+    ("indexof.patch", "jenetics/src/main/java/io/jenetics/ProbabilitySelector.java"),
+])
+def test_injection_patches_only_add_lines_to_one_file(name, java_file):
+    text = (ROOT / "case-study" / "injections" / name).read_text(encoding="utf-8")
+    files = [l[len("+++ b/"):] for l in text.splitlines() if l.startswith("+++ ")]
+    assert files == [java_file]
+    body = [l for l in text.splitlines() if l[:1] in "+-" and not l.startswith(("+++", "---"))]
+    assert body and all(l.startswith("+") for l in body)                 # adds only, removes nothing
+    added = "\n".join(l[1:] for l in body)
+    assert "private static final int INJECTED_EXTRA_PERCENT = " in added
+    assert added.count("INJECTED_EXTRA_PERCENT") == 3                    # constant, comment, use
+    assert "NASC-CI case study, not part of jenetics" in added

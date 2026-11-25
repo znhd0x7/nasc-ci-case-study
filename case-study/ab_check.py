@@ -1,4 +1,9 @@
-"""ab_check v1 (24 Nov 2026): same-VM A/B check of two commits for a few benchmarks.
+"""ab_check v2 (25 Nov 2026): same-VM A/B check of two commits for a few benchmarks.
+
+v2 (25 Nov 2026): --b-patch FILE records the injection patch the workflow applied to commit B
+(file name and sha256), so A and B may be the same commit (clean vs injected). The report then
+adds "Injected slowdown": the order-balanced difference per benchmark, labelled with the CPU
+model it was measured on, because the relative size can differ on other CPU types.
 
   python3 case-study/ab_check.py run --a-cp FILE --b-cp FILE --a SHA --b SHA \
       --bench heapSort80,serialIndexOf250 --pairs 10 --out DIR
@@ -22,6 +27,7 @@ Needs numpy. Run from the repository root.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import re
@@ -39,7 +45,7 @@ sys.path.insert(0, str(ROOT))
 from nasc_ci import VERSION, codehash, history, jmh, noise  # noqa: E402
 from nasc_ci.confirm import CAND_FIRST, REF_FIRST, batch_order  # noqa: E402
 
-AB = "ab_check v1 (24 Nov 2026)"
+AB = "ab_check v2 (25 Nov 2026)"
 HERE = Path(__file__).resolve().parent
 PROFILE = HERE / "reference_noise_profile.csv"
 BENCHMARKS = HERE / "benchmarks.txt"
@@ -177,19 +183,57 @@ def sd(x):
     return "–" if x is None else f"{x * 100:.2f}%"
 
 
+def patch_info(path):
+    """-> {"file", "sha256", "added", "removed"} of an injection patch, or None."""
+    if not path:
+        return None
+    text = Path(path).read_bytes()
+    lines = text.decode("utf-8").splitlines()
+    return {"file": Path(path).name, "sha256": hashlib.sha256(text).hexdigest(),
+            "added": sum(l.startswith("+") and not l.startswith("+++") for l in lines),
+            "removed": sum(l.startswith("-") and not l.startswith("---") for l in lines)}
+
+
+def b_label(S):
+    p = S["b"].get("patch")
+    return f"commit {S['b']['pos']}" + (f" + `{p['file']}`" if p else "")
+
+
+def code_line(S):
+    patched = bool(S["b"].get("patch"))
+    same = S["same_code"]
+    if same is None:
+        verdict = "**unknown**"
+    elif patched:
+        verdict = ("**different** (expected: B carries the injection patch)" if not same else
+                   "**identical although B is patched: the patch did not reach the compiled code**")
+    else:
+        verdict = f"**{'identical' if same else 'different'}**"
+    return (f"- Compiled code: A `{(S['code_A'] or {}).get('sha256', '?')[:12]}`, "
+            f"B `{(S['code_B'] or {}).get('sha256', '?')[:12]}` -> {verdict}.")
+
+
+def cpu_label(S):
+    m = S["machine"]
+    return f"{m.get('cpu_model') or 'unknown CPU'} ({m.get('cpus', '?')} CPUs)"
+
+
 def report(S):
-    L = [f"## Same-VM A/B check: commit {S['a']['pos']} (A) vs commit {S['b']['pos']} (B)", "",
+    p = S["b"].get("patch")
+    L = [f"## Same-VM A/B check: commit {S['a']['pos']} (A) vs {b_label(S)} (B)", "",
          f"`{S['tool']}`, source `{S['nasc_ci_source']}`; {S['ab']}. {S['pairs']} pairs per benchmark, "
          "order alternating as NASC-CI 0.3 (odd pairs candidate B first, even pairs reference A first).", "",
          f"- Machine: {S['machine'].get('cpu_model')} ({S['machine'].get('cpus')} CPUs, clock source "
          f"{S['machine'].get('clocksource')}).",
-         f"- Compiled code: A `{(S['code_A'] or {}).get('sha256', '?')[:12]}`, B `{(S['code_B'] or {}).get('sha256', '?')[:12]}` "
-         f"-> **{ {True: 'identical', False: 'different', None: 'unknown'}[S['same_code']] }**.",
+         code_line(S),
          f"- Runner minutes: {S['minutes']['setup_build']:.1f} set-up + build, {S['minutes']['measure']:.1f} measuring, "
-         f"{S['minutes']['total']:.1f} in total (from the job's first step).", "",
-         "### B vs A per order (d = mean B run / mean A run - 1; mean ± 95 % t-interval)", "",
-         "| Benchmark | Candidate (B) first | Reference (A) first | B vs A, order-balanced | Order effect (first run slower by) | sd of d |",
-         "|---|---|---|---|---|---|"]
+         f"{S['minutes']['total']:.1f} in total (from the job's first step).", ""]
+    if p:
+        L[-1:-1] = [f"- Injection patch on B: `{p['file']}` (sha256 `{p['sha256'][:12]}`, "
+                    f"{p['added']} lines added, {p['removed']} removed)."]
+    L += ["### B vs A per order (d = mean B run / mean A run - 1; mean ± 95 % t-interval)", "",
+          "| Benchmark | Candidate (B) first | Reference (A) first | B vs A, order-balanced | Order effect (first run slower by) | sd of d |",
+          "|---|---|---|---|---|---|"]
     for r in S["results"]:
         L.append(f"| `{short(r['benchmark'])}` | {ci(r['candidate_first']['mean'], r['candidate_first']['ci95'])} (n={r['candidate_first']['n']}) | "
                  f"{ci(r['reference_first']['mean'], r['reference_first']['ci95'])} (n={r['reference_first']['n']}) | "
@@ -209,6 +253,15 @@ def report(S):
         f"{short(r['benchmark'])}: " + ", ".join(f"{x * 100:+.2f}%{'ᶜ' if o == CAND_FIRST else 'ʳ'}"
                                                    for x, o in zip(r["d"], r["orders"])) for r in S["results"])
         + " (ᶜ candidate first, ʳ reference first).", ""]
+    if p:
+        L += [f"### Injected slowdown, measured on {cpu_label(S)}", "",
+              f"B = commit {S['b']['pos']} with `{p['file']}`, A = commit {S['a']['pos']} without it; "
+              "order-balanced difference, mean ± 95 % Welch interval.", "",
+              "| Benchmark | Injected slowdown | Measured on |", "|---|---|---|"]
+        for r in S["results"]:
+            L.append(f"| `{short(r['benchmark'])}` | {ci(r['difference'], r['ci95_welch'])} | {cpu_label(S)} |")
+        L += ["", f"These sizes were measured on {S['machine'].get('cpu_model') or 'an unknown CPU'}; "
+              "the relative size of the same patch may differ on other CPU types.", ""]
     return "\n".join(L)
 
 
@@ -229,7 +282,8 @@ def cmd_run(a):
     cps = {"A": Path(a.a_cp).read_text().strip(), "B": Path(a.b_cp).read_text().strip()}
     print(f"{AB}; {VERSION}; source {source_hash()}")
     plan = schedule(benches, a.pairs)
-    print(f"{len(plan) * 2} runs: {a.pairs} pairs x {len(benches)} benchmarks, A = {a.a[:10]}, B = {a.b[:10]}", flush=True)
+    print(f"{len(plan) * 2} runs: {a.pairs} pairs x {len(benches)} benchmarks, A = {a.a[:10]}, B = {a.b[:10]}"
+          + (f" + {Path(a.b_patch).name}" if a.b_patch else ""), flush=True)
     t_start = time.time()
     records = measure_all(plan, jmh_runner(cps, out, a.wi, a.iterations, a.time))
     t_end = time.time()
@@ -241,7 +295,8 @@ def cmd_run(a):
     t0 = timing.get("job_start", t_start)
     S = {"ab": AB, "tool": VERSION, "nasc_ci_source": source_hash(),
          "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-         "a": {"pos": a.a_pos, "commit": a.a}, "b": {"pos": a.b_pos, "commit": a.b}, "pairs": a.pairs,
+         "a": {"pos": a.a_pos, "commit": a.a},
+         "b": {"pos": a.b_pos, "commit": a.b, "patch": patch_info(a.b_patch)}, "pairs": a.pairs,
          "run_settings": {"wi": a.wi, "iterations": a.iterations, "time": a.time},
          "machine": load(a.machine) or {}, "code_A": code_a, "code_B": code_b,
          "same_code": codehash.same_code(code_a, code_b),
@@ -273,6 +328,7 @@ def main():
     r.add_argument("--code-a")
     r.add_argument("--code-b")
     r.add_argument("--timing")
+    r.add_argument("--b-patch", help="injection patch the workflow applied to commit B (recorded, not applied here)")
     a = p.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")

@@ -1,0 +1,28 @@
+diff --git a/jenetics/src/main/java/io/jenetics/internal/util/IndexSorter.java b/jenetics/src/main/java/io/jenetics/internal/util/IndexSorter.java
+index 80d4b6c..5610ed5 100644
+--- a/jenetics/src/main/java/io/jenetics/internal/util/IndexSorter.java
++++ b/jenetics/src/main/java/io/jenetics/internal/util/IndexSorter.java
+@@ -352,6 +352,9 @@ final class HeapSorter extends IndexSorter {
+ 
+ 	static final HeapSorter INSTANCE = new HeapSorter();
+ 
++	// NASC-CI case study: size of the injected slowdown in sort(double[], int[]).
++	private static final int INJECTED_EXTRA_PERCENT = 100;
++
+ 	@Override
+ 	public <T> int[] sort(
+ 		final Seq<? extends T> array,
+@@ -508,6 +511,13 @@ final class HeapSorter extends IndexSorter {
+ 			sink(array, indexes, k, array.length);
+ 		}
+ 
++		// Injected slowdown (NASC-CI case study, not part of jenetics): runs sink() again for
++		// INJECTED_EXTRA_PERCENT % of the inner positions (array.length/2 .. 0). The heap is
++		// already valid, so sink() moves nothing and the result is unchanged; only the time grows.
++		for (int k = array.length*INJECTED_EXTRA_PERCENT/200; k >= 0; --k) {
++			sink(array, indexes, k, array.length);
++		}
++
+ 		// Sort down.
+ 		for (int i = array.length; --i >= 1;) {
+ 			swap(indexes, 0, i);
