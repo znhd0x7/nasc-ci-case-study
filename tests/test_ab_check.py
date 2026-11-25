@@ -1,4 +1,6 @@
-"""Tests of case-study/ab_check.py v2.1 (25 Nov 2026) with a fake machine, no Java needed.
+"""Tests of case-study/ab_check.py v2.2 (25 Nov 2026) with a fake machine, no Java needed.
+
+v2.2 (25 Nov 2026): pool combines copies run on different VMs and reports the difference per CPU type.
 
 v2.1 (25 Nov 2026): the benchmarks measured head the report; a patch's benchmarks come from
 case-study/injections/targets.txt and any not measured gives a warning; targets.txt is checked.
@@ -191,3 +193,61 @@ def test_no_warning_when_all_patched_benchmarks_are_measured():
     info = ab.patch_info(str(ROOT / "case-study" / "injections" / "indexof.patch"))
     text = ab.report(report_input(res, info, same_code=False))   # measures heapSort80 + serialIndexOf250
     assert "it slows down serialIndexOf250" in text and "Warning" not in text
+
+
+def copy_result(cpu, true_change, seed, copy, patch_sha="ff" * 32):
+    """ab.json of one simulated copy: serialIndexOf250 only, on a VM with the given CPU."""
+    plan = ab.schedule([INDEX], 10)
+    run, _ = fake_machine(true_change, 0.0, c_w=0.01, c_t=0.005, seed=seed)
+    records = ab.measure_all(plan, run)
+    res = ab.analyse(records, ab.history.new()["settings"])
+    return {"copy": copy, "a": {"pos": 13, "commit": "a" * 40},
+            "b": {"pos": 13, "commit": "a" * 40, "patch": {"file": "indexof.patch", "sha256": patch_sha,
+                                                           "added": 18, "removed": 0}},
+            "machine": {"cpu_model": cpu, "cpus": 4}, "results": res}
+
+
+def test_pool_gives_the_size_per_cpu_type():
+    runs = [copy_result("Intel X", 0.15, 1, 1), copy_result("AMD Y", 0.10, 2, 2),
+            copy_result("Intel X", 0.15, 3, 3), copy_result("AMD Y", 0.10, 4, 4)]
+    P = ab.pool(runs)
+    assert P["cpu_types"] == ["AMD Y", "Intel X"]
+    by = {g["cpu"]: g for g in P["by_cpu"]}
+    assert by["Intel X"]["copies"] == 2 and by["Intel X"]["pairs"] == 20
+    assert by["Intel X"]["difference"] == pytest.approx(0.15, abs=0.01)
+    assert by["AMD Y"]["difference"] == pytest.approx(0.10, abs=0.01)
+    assert by["AMD Y"]["ci95"] < 0.01
+    assert len(P["copies"]) == 4
+    text = ab.pool_report(P, runs[0])
+    assert "4 copies" in text and "CPU types seen: AMD Y, Intel X." in text
+    assert "Only one CPU type" not in text
+    assert "| `ProbabilitySelectorIndexOfPerf.serialIndexOf250` | Intel X | 2 | 20 | +1" in text
+
+
+def test_pool_warns_when_only_one_cpu_type_was_seen_and_refuses_mixed_runs():
+    P = ab.pool([copy_result("Intel X", 0.15, 1, 1), copy_result("Intel X", 0.15, 2, 2)])
+    assert "Only one CPU type was seen" in ab.pool_report(P, copy_result("Intel X", 0.15, 1, 1))
+    with pytest.raises(SystemExit):
+        ab.pool([copy_result("Intel X", 0.15, 1, 1), copy_result("AMD Y", 0.15, 2, 2, patch_sha="ee" * 32)])
+
+
+def test_balanced_matches_analyse():
+    res, _, _ = summarise(true_change=0.05, first_penalty=0.03)
+    r = res[HEAP]
+    m, h, n = ab.balanced(r["d"], r["orders"])
+    assert m == pytest.approx(r["difference"]) and h == pytest.approx(r["ci95_welch"]) and n == 10
+
+
+def test_pool_command_reads_copy_folders(tmp_path):
+    for i, cpu in ((1, "Intel X"), (2, "AMD Y")):
+        S = copy_result(cpu, 0.15, i, i)
+        del S["copy"]
+        d = tmp_path / f"ab-check-a13-b13-indexof-run1-copy{i}"
+        d.mkdir()
+        (d / "ab.json").write_text(__import__("json").dumps(S), encoding="utf-8")
+    import types
+    ab.cmd_pool(types.SimpleNamespace(files=sorted(str(p) for p in tmp_path.glob("*/ab.json")),
+                                      out=str(tmp_path / "summary")))
+    P = __import__("json").loads((tmp_path / "summary" / "pool.json").read_text(encoding="utf-8"))
+    assert sorted(c["copy"] for c in P["copies"]) == [1, 2]
+    assert (tmp_path / "summary" / "pool.md").exists()

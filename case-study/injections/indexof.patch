@@ -1,5 +1,5 @@
 diff --git a/jenetics/src/main/java/io/jenetics/ProbabilitySelector.java b/jenetics/src/main/java/io/jenetics/ProbabilitySelector.java
-index 32da516..20d1b54 100644
+index 32da516..cb12216 100644
 --- a/jenetics/src/main/java/io/jenetics/ProbabilitySelector.java
 +++ b/jenetics/src/main/java/io/jenetics/ProbabilitySelector.java
 @@ -62,6 +62,9 @@ public abstract class ProbabilitySelector<
@@ -7,23 +7,28 @@ index 32da516..20d1b54 100644
  	private static final int SERIAL_INDEX_THRESHOLD = 35;
  
 +	// NASC-CI case study: size of the injected slowdown in indexOfSerial().
-+	private static final int INJECTED_EXTRA_PERCENT = 21;
++	private static final int INJECTED_EXTRA_PERCENT = 20;
 +
  	private static final long MAX_ULP_DISTANCE = pow(10, 10);
  
  	protected final Comparator<Phenotype<G, C>> POPULATION_COMPARATOR = (a, b) ->
-@@ -271,6 +274,16 @@ public abstract class ProbabilitySelector<
+@@ -271,6 +274,21 @@ public abstract class ProbabilitySelector<
  			}
  		}
  
-+		// Injected slowdown (NASC-CI case study, not part of jenetics): scans the first
-+		// INJECTED_EXTRA_PERCENT % of the already checked prefix again. There incr[i] < v,
-+		// so index never changes; only the time grows.
-+		final int extra = index*INJECTED_EXTRA_PERCENT/100;
-+		for (int i = 0; i < extra; ++i) {
++		// Injected slowdown v2 (NASC-CI case study, not part of jenetics): the same search
++		// loop runs again over the first INJECTED_EXTRA_PERCENT % of the prefix before index.
++		// No element there is >= v (index is the first one), so check stays -1 and the
++		// result never changes; only the time grows, in the same kind of loop.
++		final int end = index*INJECTED_EXTRA_PERCENT/100;
++		int check = -1;
++		for (int i = 0; i < end && check == -1; ++i) {
 +			if (incr[i] >= v) {
-+				index = i;
++				check = i;
 +			}
++		}
++		if (check != -1) {
++			index = check;
 +		}
 +
  		return index;

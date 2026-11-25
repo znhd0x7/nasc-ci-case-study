@@ -1,4 +1,10 @@
-# ab-check v2.1 (25 Nov 2026). Same-VM A/B check, started by hand (Actions tab > ab-check > Run workflow).
+# ab-check v2.2 (25 Nov 2026). Same-VM A/B check, started by hand (Actions tab > ab-check > Run workflow).
+# v2.2 (25 Nov 2026): input "copies" (1-4) runs that many identical "ab" jobs in parallel, each on its
+#   own VM (the runner fleet mixes Intel and AMD, and we cannot choose). Each copy uploads its own
+#   artifact (...-copy<N>). The "summary" job downloads them and runs "ab_check.py pool": the
+#   difference per CPU type (pairs pooled within a type) and per copy, in the job summary and in the
+#   artifact ...-summary. If the summary job fails, the copies' artifacts are complete and the same
+#   command can be run on the downloaded folders. Runner minutes grow with copies; wall time does not.
 # v2.1 (25 Nov 2026): benchmarks left empty -> the patch's benchmarks from case-study/injections/
 #   targets.txt (heapsort: heapSort80,heapSort250,heapSort320; indexof: serialIndexOf250), or
 #   heapSort80,serialIndexOf250 without a patch; a warning if a given list misses a patched benchmark;
@@ -47,6 +53,11 @@ on:
         type: choice
         options: [none, heapsort, indexof]
         default: none
+      copies:
+        description: "Identical A/B jobs in parallel, each on its own VM (to measure more than one CPU type)"
+        type: choice
+        options: ["1", "2", "3", "4"]
+        default: "1"
 
 permissions:
   contents: read
@@ -61,6 +72,7 @@ env:
   BENCHMARKS: ${{ inputs.benchmarks }}
   PAIRS: ${{ inputs.pairs }}
   PATCH: ${{ inputs.patch }}
+  COPIES: ${{ inputs.copies }}
 
 jobs:
   test:
@@ -70,6 +82,7 @@ jobs:
       sha_a: ${{ steps.read.outputs.sha_a }}
       sha_b: ${{ steps.read.outputs.sha_b }}
       benchmarks: ${{ steps.read.outputs.benchmarks }}
+      copies: ${{ steps.read.outputs.copies }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -112,6 +125,10 @@ jobs:
               print(f'::warning title=Patched benchmarks not measured::{patch} also slows down {\",\".join(missing)}', file=sys.stderr)
           print(f'Benchmarks: {bench}', file=sys.stderr)
           print(f'benchmarks={bench}')
+          copies = os.environ['COPIES']
+          if copies not in ('1', '2', '3', '4'):
+              sys.exit('::error::copies must be 1, 2, 3 or 4')
+          print('copies=' + str(list(range(1, int(copies) + 1))))
           rows = {p: s for p, s in (l.split()[:2] for l in open('case-study/commits.txt') if l.strip() and not l.startswith('#'))}
           for side, pos in (('a', a), ('b', b)):
               if pos not in rows:
@@ -122,7 +139,11 @@ jobs:
 
   ab:
     needs: test
-    name: A/B commit ${{ inputs.a }} vs ${{ inputs.b }}${{ inputs.patch != 'none' && format(' + {0} patch', inputs.patch) || '' }} on one VM
+    name: A/B commit ${{ inputs.a }} vs ${{ inputs.b }}${{ inputs.patch != 'none' && format(' + {0} patch', inputs.patch) || '' }}, copy ${{ matrix.copy }} of ${{ inputs.copies }}
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: ${{ fromJSON(needs.test.outputs.copies) }}
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
@@ -245,12 +266,45 @@ jobs:
             --a-pos "$POS_A" --b-pos "$POS_B" --a-cp a-classpath.txt --b-cp b-classpath.txt \
             --bench "$BENCH" --pairs "$PAIRS" --out out \
             --machine out/machine.json --code-a out/code-a.json --code-b out/code-b.json \
-            --timing out/timing.txt "${PATCH_ARG[@]}" 2>&1 | tee out/ab-check.log
+            --timing out/timing.txt --copy ${{ matrix.copy }} "${PATCH_ARG[@]}" 2>&1 | tee out/ab-check.log
           cat out/report.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: ab-check-a${{ inputs.a }}-b${{ inputs.b }}-${{ inputs.patch }}-run${{ github.run_id }}
+          name: ab-check-a${{ inputs.a }}-b${{ inputs.b }}-${{ inputs.patch }}-run${{ github.run_id }}-copy${{ matrix.copy }}
           path: out/
           retention-days: 90
           if-no-files-found: error
+
+  summary:
+    needs: [test, ab]
+    if: always() && needs.test.result == 'success'
+    name: Summary per CPU type
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install numpy
+        run: pip install numpy
+      - name: Download the copies
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ab-check-a${{ inputs.a }}-b${{ inputs.b }}-${{ inputs.patch }}-run${{ github.run_id }}-copy*
+          path: copies
+      - name: Pool the copies per CPU type
+        run: |
+          set -o pipefail
+          ls copies
+          mkdir -p summary
+          python3 case-study/ab_check.py pool copies/*/ab.json --out summary | tee summary/pool.log
+          cat summary/pool.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: ab-check-a${{ inputs.a }}-b${{ inputs.b }}-${{ inputs.patch }}-run${{ github.run_id }}-summary
+          path: summary/
+          retention-days: 90
+          if-no-files-found: warn

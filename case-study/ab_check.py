@@ -1,4 +1,9 @@
-"""ab_check v2.1 (25 Nov 2026): same-VM A/B check of two commits for a few benchmarks.
+"""ab_check v2.2 (25 Nov 2026): same-VM A/B check of two commits for a few benchmarks.
+
+v2.2 (25 Nov 2026): "pool" combines several copies of the same A/B check (one per VM, run in
+parallel by the workflow's copies input) and reports the difference per CPU type and per copy:
+  python3 case-study/ab_check.py pool DIR/*/ab.json --out DIR
+The runner fleet mixes CPU types (Intel Xeon, AMD EPYC), and an injected slowdown can differ by type.
 
 v2.1 (25 Nov 2026): the report starts with the benchmarks measured, and with a patch it names the
 benchmarks the patch slows down (case-study/injections/targets.txt) and warns about any not measured.
@@ -48,7 +53,7 @@ sys.path.insert(0, str(ROOT))
 from nasc_ci import VERSION, codehash, history, jmh, noise  # noqa: E402
 from nasc_ci.confirm import CAND_FIRST, REF_FIRST, batch_order  # noqa: E402
 
-AB = "ab_check v2.1 (25 Nov 2026)"
+AB = "ab_check v2.2 (25 Nov 2026)"
 HERE = Path(__file__).resolve().parent
 PROFILE = HERE / "reference_noise_profile.csv"
 BENCHMARKS = HERE / "benchmarks.txt"
@@ -286,6 +291,87 @@ def report(S):
     return "\n".join(L)
 
 
+def balanced(d, orders):
+    """Order-balanced difference of pairs d with their orders -> (mean, Welch 95 % half-width, n)."""
+    d, orders = np.asarray(d, dtype=float), np.asarray(orders)
+    cf, rf = d[orders == CAND_FIRST], d[orders == REF_FIRST]
+    if not len(cf) or not len(rf):
+        return float(d.mean()), None, len(d)
+    both = (cf.mean() + rf.mean()) / 2
+    half = None
+    if len(cf) > 1 and len(rf) > 1:
+        v1, v2 = cf.var(ddof=1) / len(cf), rf.var(ddof=1) / len(rf)
+        df = (v1 + v2) ** 2 / (v1 ** 2 / (len(cf) - 1) + v2 ** 2 / (len(rf) - 1)) if v1 + v2 > 0 else 1
+        half = t975(df) * math.sqrt(v1 + v2) / 2
+    return float(both), (None if half is None else float(half)), len(d)
+
+
+def pool(runs):
+    """runs: the ab.json contents of several copies of one A/B check (same commits and patch).
+    -> {"copies": per copy and benchmark, "by_cpu": pairs pooled per CPU type and benchmark}."""
+    keys = {(S["a"]["commit"], S["b"]["commit"], (S["b"].get("patch") or {}).get("sha256")) for S in runs}
+    if len(keys) != 1:
+        sys.exit("pool: the copies differ in commit A, commit B or the patch")
+    copies, groups = [], {}
+    for i, S in enumerate(runs, start=1):
+        cpu = S["machine"].get("cpu_model") or "unknown CPU"
+        for r in S["results"]:
+            b = short(r["benchmark"])
+            copies.append({"copy": S.get("copy", i), "cpu": cpu, "benchmark": b, "difference": r["difference"],
+                           "ci95": r["ci95_welch"], "pairs": r["pairs"],
+                           "delta_feasible": r["noise_AB"]["delta_feasible"],
+                           "feasible": r["noise_AB"]["feasible"]})
+            g = groups.setdefault((cpu, b), {"d": [], "orders": [], "copies": 0})
+            g["d"] += r["d"]
+            g["orders"] += r["orders"]
+            g["copies"] += 1
+    by_cpu = []
+    for (cpu, b), g in sorted(groups.items(), key=lambda kv: (kv[0][1], kv[0][0])):
+        m, h, n = balanced(g["d"], g["orders"])
+        by_cpu.append({"cpu": cpu, "benchmark": b, "copies": g["copies"], "pairs": n, "difference": m, "ci95": h})
+    return {"copies": copies, "by_cpu": by_cpu, "cpu_types": sorted({c["cpu"] for c in copies})}
+
+
+def pool_report(P, S0):
+    p = S0["b"].get("patch")
+    L = [f"## Pooled A/B check: commit {S0['a']['pos']} (A) vs {b_label(S0)} (B), {len({c['copy'] for c in P['copies']})} copies", "",
+         f"`{AB}`. Each copy ran on its own VM; pairs are pooled per CPU type (order-balanced, mean ± 95 % Welch).", "",
+         f"CPU types seen: {', '.join(P['cpu_types'])}."]
+    if len(P["cpu_types"]) < 2:
+        L += ["", "**Only one CPU type was seen: run more copies to measure the other type.**"]
+    L += ["", "### Per CPU type", "", "| Benchmark | CPU | Copies | Pairs | B vs A (order-balanced) |", "|---|---|---|---|---|"]
+    for g in P["by_cpu"]:
+        L.append(f"| `{g['benchmark']}` | {g['cpu']} | {g['copies']} | {g['pairs']} | {ci(g['difference'], g['ci95'])} |")
+    L += ["", "### Per copy", "", "| Copy | CPU | Benchmark | B vs A (order-balanced) | Smallest confirmable slowdown on this VM |",
+          "|---|---|---|---|---|"]
+    for c in sorted(P["copies"], key=lambda c: (c["copy"], c["benchmark"])):
+        L.append(f"| {c['copy']} | {c['cpu']} | `{c['benchmark']}` | {ci(c['difference'], c['ci95'])} | "
+                 f"{c['delta_feasible'] * 100:.1f}%{'' if c['feasible'] else ' (infeasible)'} |")
+    if p:
+        L += ["", f"Injected slowdown of `{p['file']}` (sha256 `{p['sha256'][:12]}`): the per-CPU rows above, each "
+              "measured on the CPU named; the relative size of the same patch differs between CPU types.", ""]
+    return "\n".join(L)
+
+
+def cmd_pool(a):
+    files = [Path(f) for f in a.files]
+    runs = []
+    for f in files:
+        S = json.loads(f.read_text(encoding="utf-8"))
+        m = re.search(r"copy(\d+)", str(f.parent))
+        if m and "copy" not in S:
+            S["copy"] = int(m.group(1))
+        runs.append(S)
+    P = pool(runs)
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "pool.json").write_text(json.dumps({"ab": AB, "files": [str(f) for f in files], **P}, indent=1),
+                                   encoding="utf-8")
+    text = pool_report(P, runs[0])
+    (out / "pool.md").write_text(text, encoding="utf-8")
+    print(text)
+
+
 def read_timing(path):
     out = {}
     if path and Path(path).exists():
@@ -316,7 +402,7 @@ def cmd_run(a):
     t0 = timing.get("job_start", t_start)
     S = {"ab": AB, "tool": VERSION, "nasc_ci_source": source_hash(),
          "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-         "a": {"pos": a.a_pos, "commit": a.a},
+         "copy": a.copy, "a": {"pos": a.a_pos, "commit": a.a},
          "b": {"pos": a.b_pos, "commit": a.b, "patch": patch_info(a.b_patch)}, "pairs": a.pairs,
          "run_settings": {"wi": a.wi, "iterations": a.iterations, "time": a.time},
          "machine": load(a.machine) or {}, "code_A": code_a, "code_B": code_b,
@@ -350,10 +436,14 @@ def main():
     r.add_argument("--code-b")
     r.add_argument("--timing")
     r.add_argument("--b-patch", help="injection patch the workflow applied to commit B (recorded, not applied here)")
+    r.add_argument("--copy", type=int, default=1, help="copy number when the workflow runs several copies")
+    q = sub.add_parser("pool", help="combine copies of one A/B check: the difference per CPU type and per copy")
+    q.add_argument("files", nargs="+", help="ab.json of each copy (a folder name with copyN sets the copy number)")
+    q.add_argument("--out", required=True)
     a = p.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    cmd_run(a)
+    (cmd_run if a.cmd == "run" else cmd_pool)(a)
 
 
 if __name__ == "__main__":
