@@ -1,4 +1,9 @@
-# ab-check v2 (25 Nov 2026). Same-VM A/B check, started by hand (Actions tab > ab-check > Run workflow).
+# ab-check v2.1 (25 Nov 2026). Same-VM A/B check, started by hand (Actions tab > ab-check > Run workflow).
+# v2.1 (25 Nov 2026): benchmarks left empty -> the patch's benchmarks from case-study/injections/
+#   targets.txt (heapsort: heapSort80,heapSort250,heapSort320; indexof: serialIndexOf250), or
+#   heapSort80,serialIndexOf250 without a patch; a warning if a given list misses a patched benchmark;
+#   the benchmarks used are printed in the log and at the top of the report; the artifact is named
+#   after the inputs and the run id, so two downloads cannot be mixed up.
 # v2 (25 Nov 2026): optional input "patch" (heapsort or indexof) applies an injection patch from
 #   case-study/injections/ to commit B only, so A and B may be the same commit (clean vs injected).
 #   The patch is applied with "git apply --check" first, copied into the artifact with its sha256,
@@ -32,8 +37,8 @@ on:
         description: "Position of commit B, the candidate"
         default: "2"
       benchmarks:
-        description: "Benchmarks (short names, comma-separated)"
-        default: "heapSort80,serialIndexOf250"
+        description: "Benchmarks (short names, comma-separated). Empty: the patch's benchmarks, or heapSort80,serialIndexOf250 without a patch"
+        default: ""
       pairs:
         description: "Pairs per benchmark (even, so both orders get the same number)"
         default: "10"
@@ -64,6 +69,7 @@ jobs:
     outputs:
       sha_a: ${{ steps.read.outputs.sha_a }}
       sha_b: ${{ steps.read.outputs.sha_b }}
+      benchmarks: ${{ steps.read.outputs.benchmarks }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -94,8 +100,18 @@ jobs:
               sys.exit(f'::error::case-study/injections/{patch}.patch is missing')
           if not (pairs.isdigit() and int(pairs) >= 2 and int(pairs) % 2 == 0):
               sys.exit('::error::pairs must be an even number, 2 or more')
-          if not re.fullmatch(r'[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*', os.environ['BENCHMARKS']):
+          targets = {l.split()[0]: l.split()[2].split(',') for l in open('case-study/injections/targets.txt')
+                     if l.strip() and not l.startswith('#')}
+          bench = os.environ['BENCHMARKS'].replace(' ', '')
+          if not bench:
+              bench = ','.join(targets[patch]) if patch != 'none' else 'heapSort80,serialIndexOf250'
+          if not re.fullmatch(r'[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*', bench):
               sys.exit('::error::benchmarks must be short names separated by commas')
+          missing = [t for t in targets.get(patch, []) if t not in bench.split(',')]
+          if missing:
+              print(f'::warning title=Patched benchmarks not measured::{patch} also slows down {\",\".join(missing)}', file=sys.stderr)
+          print(f'Benchmarks: {bench}', file=sys.stderr)
+          print(f'benchmarks={bench}')
           rows = {p: s for p, s in (l.split()[:2] for l in open('case-study/commits.txt') if l.strip() and not l.startswith('#'))}
           for side, pos in (('a', a), ('b', b)):
               if pos not in rows:
@@ -217,21 +233,24 @@ jobs:
               ../$side-src/jenetics/build/classes/java/jmh --out ../out/code-$side.json
           done
       - name: A/B runs and the report (about 10 to 31 minutes, see the header)
+        env:
+          BENCH: ${{ needs.test.outputs.benchmarks }}
         run: |
           set -o pipefail
+          echo "Benchmarks: $BENCH ($PAIRS pairs each)"
           PATCH_ARG=()
           if [ "$PATCH" != "none" ]; then PATCH_ARG=(--b-patch "tools/case-study/injections/$PATCH.patch"); fi
           python3 tools/case-study/ab_check.py run \
             --a ${{ needs.test.outputs.sha_a }} --b ${{ needs.test.outputs.sha_b }} \
             --a-pos "$POS_A" --b-pos "$POS_B" --a-cp a-classpath.txt --b-cp b-classpath.txt \
-            --bench "$BENCHMARKS" --pairs "$PAIRS" --out out \
+            --bench "$BENCH" --pairs "$PAIRS" --out out \
             --machine out/machine.json --code-a out/code-a.json --code-b out/code-b.json \
             --timing out/timing.txt "${PATCH_ARG[@]}" 2>&1 | tee out/ab-check.log
           cat out/report.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: ab-check-results
+          name: ab-check-a${{ inputs.a }}-b${{ inputs.b }}-${{ inputs.patch }}-run${{ github.run_id }}
           path: out/
           retention-days: 90
           if-no-files-found: error

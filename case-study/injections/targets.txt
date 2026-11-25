@@ -1,0 +1,6 @@
+# Injection patches of the case study (25 Nov 2026): where each one starts and what it slows down.
+# The full study applies a patch from its first commit to commit 15 (it persists); ab-check measures
+# a patch with a=b=<first commit>. Columns: patch name, first commit (position in commits.txt),
+# the benchmarks the patched method is used by (short names, comma-separated; the target first).
+heapsort  9   heapSort80,heapSort250,heapSort320
+indexof   13  serialIndexOf250

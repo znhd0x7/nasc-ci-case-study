@@ -1,5 +1,5 @@
 diff --git a/jenetics/src/main/java/io/jenetics/internal/util/IndexSorter.java b/jenetics/src/main/java/io/jenetics/internal/util/IndexSorter.java
-index 80d4b6c..5610ed5 100644
+index 80d4b6c..c529732 100644
 --- a/jenetics/src/main/java/io/jenetics/internal/util/IndexSorter.java
 +++ b/jenetics/src/main/java/io/jenetics/internal/util/IndexSorter.java
 @@ -352,6 +352,9 @@ final class HeapSorter extends IndexSorter {
@@ -7,7 +7,7 @@ index 80d4b6c..5610ed5 100644
  	static final HeapSorter INSTANCE = new HeapSorter();
  
 +	// NASC-CI case study: size of the injected slowdown in sort(double[], int[]).
-+	private static final int INJECTED_EXTRA_PERCENT = 100;
++	private static final int INJECTED_EXTRA_PERCENT = 37;
 +
  	@Override
  	public <T> int[] sort(

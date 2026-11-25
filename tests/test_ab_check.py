@@ -1,4 +1,7 @@
-"""Tests of case-study/ab_check.py v2 (25 Nov 2026) with a fake machine, no Java needed.
+"""Tests of case-study/ab_check.py v2.1 (25 Nov 2026) with a fake machine, no Java needed.
+
+v2.1 (25 Nov 2026): the benchmarks measured head the report; a patch's benchmarks come from
+case-study/injections/targets.txt and any not measured gives a warning; targets.txt is checked.
 
 v2 (25 Nov 2026): the injection patch on B is recorded and its slowdown is reported with the CPU
 model it was measured on; the two patch files in case-study/injections/ are checked as text.
@@ -137,6 +140,9 @@ def test_injection_patch_is_recorded_and_its_size_reported_with_the_cpu():
     res, _, _ = summarise(true_change=0.05, first_penalty=0.0)
     text = ab.report(report_input(res, info, same_code=False))
     assert "commit 9 (A) vs commit 9 + `heapsort.patch` (B)" in text
+    assert "**Benchmarks measured (10 pairs each): heapSort80, serialIndexOf250**" in text
+    assert "it slows down heapSort80, heapSort250, heapSort320" in text
+    assert "Warning: not measured in this run: heapSort250, heapSort320" in text
     assert "### Injected slowdown, measured on Test CPU (4 CPUs)" in text
     assert "may differ on other CPU types" in text
     assert "expected: B carries the injection patch" in text
@@ -166,3 +172,22 @@ def test_injection_patches_only_add_lines_to_one_file(name, java_file):
     assert "private static final int INJECTED_EXTRA_PERCENT = " in added
     assert added.count("INJECTED_EXTRA_PERCENT") == 3                    # constant, comment, use
     assert "NASC-CI case study, not part of jenetics" in added
+
+
+def test_targets_file_matches_patches_and_benchmarks():
+    rows = [l.split() for l in ab.TARGETS.read_text(encoding="utf-8").splitlines()
+            if l.strip() and not l.startswith("#")]
+    assert [(r[0], r[1]) for r in rows] == [("heapsort", "9"), ("indexof", "13")]
+    for name, _, benches in rows:
+        assert (ROOT / "case-study" / "injections" / f"{name}.patch").is_file()
+        assert ab.full_names(benches.split(","))                         # every name is in benchmarks.txt
+    assert ab.patch_targets("x/heapsort.patch") == ["heapSort80", "heapSort250", "heapSort320"]
+    assert ab.patch_targets("indexof.patch") == ["serialIndexOf250"]
+    assert ab.patch_targets("other.patch") == []
+
+
+def test_no_warning_when_all_patched_benchmarks_are_measured():
+    res, _, _ = summarise(true_change=0.05, first_penalty=0.0)
+    info = ab.patch_info(str(ROOT / "case-study" / "injections" / "indexof.patch"))
+    text = ab.report(report_input(res, info, same_code=False))   # measures heapSort80 + serialIndexOf250
+    assert "it slows down serialIndexOf250" in text and "Warning" not in text

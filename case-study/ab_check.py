@@ -1,4 +1,7 @@
-"""ab_check v2 (25 Nov 2026): same-VM A/B check of two commits for a few benchmarks.
+"""ab_check v2.1 (25 Nov 2026): same-VM A/B check of two commits for a few benchmarks.
+
+v2.1 (25 Nov 2026): the report starts with the benchmarks measured, and with a patch it names the
+benchmarks the patch slows down (case-study/injections/targets.txt) and warns about any not measured.
 
 v2 (25 Nov 2026): --b-patch FILE records the injection patch the workflow applied to commit B
 (file name and sha256), so A and B may be the same commit (clean vs injected). The report then
@@ -45,10 +48,11 @@ sys.path.insert(0, str(ROOT))
 from nasc_ci import VERSION, codehash, history, jmh, noise  # noqa: E402
 from nasc_ci.confirm import CAND_FIRST, REF_FIRST, batch_order  # noqa: E402
 
-AB = "ab_check v2 (25 Nov 2026)"
+AB = "ab_check v2.1 (25 Nov 2026)"
 HERE = Path(__file__).resolve().parent
 PROFILE = HERE / "reference_noise_profile.csv"
 BENCHMARKS = HERE / "benchmarks.txt"
+TARGETS = HERE / "injections" / "targets.txt"
 # two-sided 95 % quantiles of Student's t, df 1..30 (above 30: 1.96 is close enough here)
 T975 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179, 2.160,
         2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064, 2.060, 2.056,
@@ -194,6 +198,16 @@ def patch_info(path):
             "removed": sum(l.startswith("-") and not l.startswith("---") for l in lines)}
 
 
+def patch_targets(patch_file):
+    """-> the short names of the benchmarks a patch slows down (targets.txt), [] if not listed."""
+    name = Path(patch_file).name.removesuffix(".patch")
+    for line in TARGETS.read_text(encoding="utf-8").splitlines():
+        cols = line.split()
+        if cols and not line.startswith("#") and cols[0] == name:
+            return cols[2].split(",")
+    return []
+
+
 def b_label(S):
     p = S["b"].get("patch")
     return f"commit {S['b']['pos']}" + (f" + `{p['file']}`" if p else "")
@@ -220,7 +234,9 @@ def cpu_label(S):
 
 def report(S):
     p = S["b"].get("patch")
+    measured = [short(r["benchmark"]).split(".")[-1] for r in S["results"]]
     L = [f"## Same-VM A/B check: commit {S['a']['pos']} (A) vs {b_label(S)} (B)", "",
+         f"**Benchmarks measured ({S['pairs']} pairs each): {', '.join(measured)}**", "",
          f"`{S['tool']}`, source `{S['nasc_ci_source']}`; {S['ab']}. {S['pairs']} pairs per benchmark, "
          "order alternating as NASC-CI 0.3 (odd pairs candidate B first, even pairs reference A first).", "",
          f"- Machine: {S['machine'].get('cpu_model')} ({S['machine'].get('cpus')} CPUs, clock source "
@@ -229,8 +245,13 @@ def report(S):
          f"- Runner minutes: {S['minutes']['setup_build']:.1f} set-up + build, {S['minutes']['measure']:.1f} measuring, "
          f"{S['minutes']['total']:.1f} in total (from the job's first step).", ""]
     if p:
+        targets = patch_targets(p["file"])
+        missing = [t for t in targets if t not in measured]
         L[-1:-1] = [f"- Injection patch on B: `{p['file']}` (sha256 `{p['sha256'][:12]}`, "
-                    f"{p['added']} lines added, {p['removed']} removed)."]
+                    f"{p['added']} lines added, {p['removed']} removed); it slows down "
+                    f"{', '.join(targets) or 'no listed benchmark'}."]
+        if missing:
+            L[-1:-1] = [f"- **Warning: not measured in this run: {', '.join(missing)}.**"]
     L += ["### B vs A per order (d = mean B run / mean A run - 1; mean ± 95 % t-interval)", "",
           "| Benchmark | Candidate (B) first | Reference (A) first | B vs A, order-balanced | Order effect (first run slower by) | sd of d |",
           "|---|---|---|---|---|---|"]
