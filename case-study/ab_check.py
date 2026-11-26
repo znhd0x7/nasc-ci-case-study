@@ -1,4 +1,9 @@
-"""ab_check v2.2 (25 Nov 2026): same-VM A/B check of two commits for a few benchmarks.
+"""ab_check v2.3 (26 Nov 2026): same-VM A/B check of two commits for a few benchmarks.
+
+v2.3 (26 Nov 2026, guard G5): "pool --expected N" names the copies that are missing (a copy whose
+job failed uploads no ab.json): the summary then starts with "Incomplete", lists them, and the
+command prints a GitHub warning, so a 3-of-4 summary can never pass for a complete one:
+  python3 case-study/ab_check.py pool DIR/*/ab.json --expected 4 --out DIR
 
 v2.2 (25 Nov 2026): "pool" combines several copies of the same A/B check (one per VM, run in
 parallel by the workflow's copies input) and reports the difference per CPU type and per copy:
@@ -53,7 +58,7 @@ sys.path.insert(0, str(ROOT))
 from nasc_ci import VERSION, codehash, history, jmh, noise  # noqa: E402
 from nasc_ci.confirm import CAND_FIRST, REF_FIRST, batch_order  # noqa: E402
 
-AB = "ab_check v2.2 (25 Nov 2026)"
+AB = "ab_check v2.3 (26 Nov 2026)"
 HERE = Path(__file__).resolve().parent
 PROFILE = HERE / "reference_noise_profile.csv"
 BENCHMARKS = HERE / "benchmarks.txt"
@@ -332,11 +337,21 @@ def pool(runs):
     return {"copies": copies, "by_cpu": by_cpu, "cpu_types": sorted({c["cpu"] for c in copies})}
 
 
+def missing_copies(P, expected):
+    """Copy numbers 1..expected with no result among the pooled copies."""
+    have = {c["copy"] for c in P["copies"]}
+    return [i for i in range(1, expected + 1) if i not in have] if expected else []
+
+
 def pool_report(P, S0):
     p = S0["b"].get("patch")
-    L = [f"## Pooled A/B check: commit {S0['a']['pos']} (A) vs {b_label(S0)} (B), {len({c['copy'] for c in P['copies']})} copies", "",
-         f"`{AB}`. Each copy ran on its own VM; pairs are pooled per CPU type (order-balanced, mean ± 95 % Welch).", "",
-         f"CPU types seen: {', '.join(P['cpu_types'])}."]
+    L = [f"## Pooled A/B check: commit {S0['a']['pos']} (A) vs {b_label(S0)} (B), {len({c['copy'] for c in P['copies']})} copies", ""]
+    if P.get("missing_copies"):
+        L += [f"**Incomplete: {len(P['missing_copies'])} of {P['expected']} copies missing (job failed or artifact "
+              f"missing): " + ", ".join(f"copy {i}" for i in P["missing_copies"]) + ". The rows below are the "
+              "copies that finished; re-run the failed job(s) and pool again.**", ""]
+    L += [f"`{AB}`. Each copy ran on its own VM; pairs are pooled per CPU type (order-balanced, mean ± 95 % Welch).", "",
+          f"CPU types seen: {', '.join(P['cpu_types'])}."]
     if len(P["cpu_types"]) < 2:
         L += ["", "**Only one CPU type was seen: run more copies to measure the other type.**"]
     L += ["", "### Per CPU type", "", "| Benchmark | CPU | Copies | Pairs | B vs A (order-balanced) |", "|---|---|---|---|---|"]
@@ -363,6 +378,8 @@ def cmd_pool(a):
             S["copy"] = int(m.group(1))
         runs.append(S)
     P = pool(runs)
+    expected = getattr(a, "expected", None)
+    P["expected"], P["missing_copies"] = expected, missing_copies(P, expected)
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
     (out / "pool.json").write_text(json.dumps({"ab": AB, "files": [str(f) for f in files], **P}, indent=1),
@@ -370,6 +387,9 @@ def cmd_pool(a):
     text = pool_report(P, runs[0])
     (out / "pool.md").write_text(text, encoding="utf-8")
     print(text)
+    if P["missing_copies"]:
+        print(f"::warning title=Copies missing::{len(P['missing_copies'])} of {expected} copies have no result: "
+              + ", ".join(f"copy {i}" for i in P["missing_copies"]))
 
 
 def read_timing(path):
@@ -440,6 +460,7 @@ def main():
     q = sub.add_parser("pool", help="combine copies of one A/B check: the difference per CPU type and per copy")
     q.add_argument("files", nargs="+", help="ab.json of each copy (a folder name with copyN sets the copy number)")
     q.add_argument("--out", required=True)
+    q.add_argument("--expected", type=int, help="number of copies the workflow started (names the missing ones)")
     a = p.parse_args()
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")

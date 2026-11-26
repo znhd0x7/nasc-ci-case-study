@@ -1,4 +1,12 @@
-# ab-check v2.2 (25 Nov 2026). Same-VM A/B check, started by hand (Actions tab > ab-check > Run workflow).
+# ab-check v2.3 (26 Nov 2026). Same-VM A/B check, started by hand (Actions tab > ab-check > Run workflow).
+# v2.3 (26 Nov 2026), the guards after copy 4 of run 45793112030 failed in "Build both JMH jars":
+#   G1 each build is retried after 60 s and after another 180 s; a third failure stops the job with
+#      "Build failed three times";
+#   G2 the Gradle output goes to out/build-a.log / build-b.log, every step writes its name to
+#      out/stage.txt, and a failed job writes out/FAILED.txt (last stage + the last 40 lines of the
+#      newest log), all in the copy's artifact, so a failed copy explains itself from its files;
+#   G5 the summary job runs "ab_check.py pool --expected <copies>": missing copies are named at the top
+#      of the summary ("Incomplete: ...") and as a warning.
 # v2.2 (25 Nov 2026): input "copies" (1-4) runs that many identical "ab" jobs in parallel, each on its
 #   own VM (the runner fleet mixes Intel and AMD, and we cannot choose). Each copy uploads its own
 #   artifact (...-copy<N>). The "summary" job downloads them and runs "ab_check.py pool": the
@@ -148,7 +156,10 @@ jobs:
     timeout-minutes: 50
     steps:
       - name: Start the clock
-        run: mkdir -p out && echo "job_start=$(date +%s)" > out/timing.txt
+        run: |
+          mkdir -p out
+          echo "job_start=$(date +%s)" > out/timing.txt
+          echo "$(date -u +%H:%M:%S) start" > out/stage.txt
       - name: Check out the case-study files
         uses: actions/checkout@v7
         with:
@@ -222,8 +233,9 @@ jobs:
       - name: Check the JDK build
         run: |
           java -version 2>&1 | tee out/jdk.txt
-          grep -q "Temurin" out/jdk.txt && grep -q "1.8.0_514-b01" out/jdk.txt || {
-            echo "::error title=Wrong JDK::expected Temurin 1.8.0_514-b01"; exit 1; }
+          if ! { grep -q "Temurin" out/jdk.txt && grep -q "1.8.0_514-b01" out/jdk.txt; }; then
+            echo "::error title=Wrong JDK::expected Temurin 1.8.0_514-b01"; exit 1
+          fi
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
@@ -237,18 +249,34 @@ jobs:
           python3 -m nasc_ci machine --out ../out/machine.json
           lscpu > ../out/lscpu.txt
           grep -m1 "model name" /proc/cpuinfo
-      - name: Build both JMH jars
+      - name: Build both JMH jars (G1, up to 3 tries each)
         run: |
-          for side in a b; do
-            ( cd $side-src && chmod +x gradlew && ./gradlew --no-daemon --console=plain \
-                --init-script ../tools/case-study/print-jmh-classpath.gradle \
-                :jenetics:jmhJar :jenetics:printJmhClasspath )
-            JAR=$(ls $side-src/jenetics/build/libs/*-jmh.jar | head -1)
-            echo "$PWD/$JAR:$(cat $side-src/jenetics/build/jmh-classpath.txt)" > $side-classpath.txt
-          done
+          set -o pipefail
+          build() {  # $1 = side (a or b)
+            for wait in 0 60 180; do
+              if [ "$wait" -gt 0 ]; then
+                echo "Build of $1 failed; waiting $wait s and trying again." | tee -a "out/build-$1.log"
+                sleep "$wait"
+              fi
+              echo "$(date -u +%H:%M:%S) build $1 (try after $wait s)" >> out/stage.txt
+              if ( cd "$1-src" && chmod +x gradlew && ./gradlew --no-daemon --console=plain \
+                     --init-script ../tools/case-study/print-jmh-classpath.gradle \
+                     :jenetics:jmhJar :jenetics:printJmhClasspath ) 2>&1 | tee -a "out/build-$1.log"; then
+                # shellcheck disable=SC2012
+                JAR=$(ls "$1"-src/jenetics/build/libs/*-jmh.jar | head -1)
+                echo "$PWD/$JAR:$(cat "$1-src/jenetics/build/jmh-classpath.txt")" > "$1-classpath.txt"
+                return 0
+              fi
+            done
+            echo "::error title=Build failed three times::side $1: see out/build-$1.log in the artifact. Re-run failed jobs."
+            return 1
+          }
+          build a
+          build b
       - name: Hash the compiled code of both commits
         working-directory: tools
         run: |
+          echo "$(date -u +%H:%M:%S) code hash" >> ../out/stage.txt
           for side in a b; do
             python3 -m nasc_ci codehash ../$side-src/jenetics/build/classes/java/main \
               ../$side-src/jenetics/build/classes/java/jmh --out ../out/code-$side.json
@@ -258,6 +286,7 @@ jobs:
           BENCH: ${{ needs.test.outputs.benchmarks }}
         run: |
           set -o pipefail
+          echo "$(date -u +%H:%M:%S) A/B runs" >> out/stage.txt
           echo "Benchmarks: $BENCH ($PAIRS pairs each)"
           PATCH_ARG=()
           if [ "$PATCH" != "none" ]; then PATCH_ARG=(--b-patch "tools/case-study/injections/$PATCH.patch"); fi
@@ -268,12 +297,26 @@ jobs:
             --machine out/machine.json --code-a out/code-a.json --code-b out/code-b.json \
             --timing out/timing.txt --copy ${{ matrix.copy }} "${PATCH_ARG[@]}" 2>&1 | tee out/ab-check.log
           cat out/report.md >> "$GITHUB_STEP_SUMMARY"
+          echo "$(date -u +%H:%M:%S) done" >> out/stage.txt
+      - name: Explain the failure (G2)
+        if: failure()
+        run: |
+          # shellcheck disable=SC2012
+          LOG=$(ls -t out/*.log 2>/dev/null | head -1 || true)
+          {
+            echo "copy ${{ matrix.copy }} FAILED. Last stage reached:"
+            tail -1 out/stage.txt 2>/dev/null || echo "(none)"
+            echo
+            if [ -n "$LOG" ]; then echo "Last 40 lines of $LOG:"; tail -40 "$LOG"; else echo "No log was written."; fi
+          } > out/FAILED.txt
+          cat out/FAILED.txt
       - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ab-check-a${{ inputs.a }}-b${{ inputs.b }}-${{ inputs.patch }}-run${{ github.run_id }}-copy${{ matrix.copy }}
           path: out/
           retention-days: 90
+          overwrite: true
           if-no-files-found: error
 
   summary:
@@ -299,7 +342,12 @@ jobs:
           set -o pipefail
           ls copies
           mkdir -p summary
-          python3 case-study/ab_check.py pool copies/*/ab.json --out summary | tee summary/pool.log
+          shopt -s nullglob
+          files=(copies/*/ab.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error title=No copy finished::none of the $COPIES copies uploaded an ab.json"; exit 1
+          fi
+          python3 case-study/ab_check.py pool "${files[@]}" --expected "$COPIES" --out summary | tee summary/pool.log
           cat summary/pool.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v7
         if: always()

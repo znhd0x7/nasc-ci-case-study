@@ -1,4 +1,6 @@
-"""Tests of case-study/ab_check.py v2.2 (25 Nov 2026) with a fake machine, no Java needed.
+"""Tests of case-study/ab_check.py v2.3 (26 Nov 2026) with a fake machine, no Java needed.
+
+v2.3 (26 Nov 2026): pool --expected names missing copies (guard G5).
 
 v2.2 (25 Nov 2026): pool combines copies run on different VMs and reports the difference per CPU type.
 
@@ -251,3 +253,27 @@ def test_pool_command_reads_copy_folders(tmp_path):
     P = __import__("json").loads((tmp_path / "summary" / "pool.json").read_text(encoding="utf-8"))
     assert sorted(c["copy"] for c in P["copies"]) == [1, 2]
     assert (tmp_path / "summary" / "pool.md").exists()
+
+
+def test_pool_names_missing_copies(tmp_path, capsys):
+    """G5 (26 Nov 2026): 4 copies started, copy 3 failed (no ab.json): the summary says so."""
+    import json
+    import types
+    for i in (1, 2, 4):
+        d = tmp_path / f"ab-check-a13-b13-indexof-run1-copy{i}"
+        d.mkdir()
+        S = copy_result("AMD Y", 0.15, i, i)
+        del S["copy"]
+        (d / "ab.json").write_text(json.dumps(S), encoding="utf-8")
+    files = sorted(str(p) for p in tmp_path.glob("*/ab.json"))
+    ab.cmd_pool(types.SimpleNamespace(files=files, out=str(tmp_path / "s"), expected=4))
+    out = capsys.readouterr().out
+    P = json.loads((tmp_path / "s" / "pool.json").read_text(encoding="utf-8"))
+    assert P["missing_copies"] == [3] and P["expected"] == 4
+    text = (tmp_path / "s" / "pool.md").read_text(encoding="utf-8")
+    assert "**Incomplete: 1 of 4 copies missing (job failed or artifact missing): copy 3." in text
+    assert "::warning title=Copies missing::1 of 4 copies have no result: copy 3" in out
+    ab.cmd_pool(types.SimpleNamespace(files=files, out=str(tmp_path / "s2"), expected=3))
+    assert "Incomplete" in (tmp_path / "s2" / "pool.md").read_text(encoding="utf-8")   # copy 3 of 3 missing
+    ab.cmd_pool(types.SimpleNamespace(files=files[:2], out=str(tmp_path / "s3"), expected=2))
+    assert "Incomplete" not in (tmp_path / "s3" / "pool.md").read_text(encoding="utf-8")

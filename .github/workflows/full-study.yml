@@ -1,0 +1,577 @@
+# full-study v1 (26 Nov 2026). The NASC-CI case study on 15 jenetics commits, started by hand
+# (Actions tab > full-study > Run workflow). All settings are in case-study/study_settings.json.
+#   test     the unit tests and the NASC-CI version stamp; the 15 commits with their injection patches
+#   record   15 jobs, one per commit, each on its own VM: build (with the patches due at that commit:
+#            heapsort from 9, heapsort + indexof from 13), compiled-code hash, CPU log, the 10 benchmarks
+#            x 3 forks (JMH -bm sample -tu ns -f 3 -wi 10 -i 20 -w 1s -r 1s, about 15 min), the check
+#            (study.py record), and the build packed for the confirm jobs. Commits 9 and 13 also build
+#            the clean variant (without the patch that starts there) for the same-VM ground truth.
+#   profile  the completeness gate over the 15 recordings, then the noise profile frozen from commits 1-5
+#   confirm  10 jobs, one per benchmark: commits 6-15 in order, every detector (threshold, t-test,
+#            bootstrap) x arm (none, static, static-mid, NASC) with its own window; one 5-batch ABBA
+#            confirmation of k vs k-1 when any confirming arm flags k. The 4 injected benchmarks then
+#            run the same-VM ground truth: ab_check.py run, 10 pairs, clean vs patched build of the
+#            injection's first commit (heapsort: 9 vs 9 + heapsort; indexof: 13 + heapsort vs 13 + both).
+#   report   the completeness gate over everything, then the scores (score_series' rules) and report.md;
+#            INCOMPLETE and red if anything is missing (a missing check never counts as "no alert").
+# Guards (26 Nov 2026): G1 every build is retried after 60 s and 180 s; G2 every job writes the step it
+# reached to out/stage.txt, Gradle and JMH output to out/*.log, and on failure out/FAILED.txt (last
+# stage and the last 40 lines of the newest log), all in its artifact; G3 profile and confirm need every
+# record job, and the report job checks every artifact; G4 "Re-run failed jobs" re-runs only the failed
+# jobs (artifacts are overwritten, the other recordings are kept), the re-run VM's CPU is logged.
+# Runner time about 650 min (about 435-855), wall time about 65-90 min.
+# Java is Temurin 8.0.514+1 (1.8.0_514-b01), set up as in ab-check v2.2 (checksum on, two retries,
+# cache-jdk, a clear stop, never another JDK). Results are kept 90 days, packed builds 14 days; copy
+# the results into the private results folder before then.
+name: full-study
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: measurements
+  cancel-in-progress: false
+
+env:
+  JMH_RECORD: -bm sample -tu ns -f 3 -wi 10 -i 20 -w 1s -r 1s -foe true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      commits: ${{ steps.read.outputs.commits }}
+      benchmarks: ${{ steps.read.outputs.benchmarks }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Unit tests
+        run: |
+          pip install numpy pandas pytest
+          python -m pytest -q -p no:cacheprovider tests
+      - name: Check the NASC-CI version stamp
+        run: |
+          python -c "import nasc_ci; print(nasc_ci.VERSION)"
+          grep -Eq '^[0-9a-f]{40}$' nasc_ci/VERSION || { echo "::error title=No version stamp::nasc_ci/VERSION must hold one 40-character commit hash"; exit 1; }
+          echo "NASC-CI source: $(cat nasc_ci/VERSION)"
+      - id: read
+        name: The 15 commits with their patches, and the 10 benchmarks
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'EOF'
+          import json, sys
+          sys.path.insert(0, "case-study")
+          import study
+          S = study.settings()
+          first, last = S["positions"]
+          rows = [{"pos": p, "tag": f"{p:02d}", "sha": sha, "patches": " ".join(study.patches_at(p)),
+                   "new": study.new_patch(p) or ""} for p, sha in sorted(study.commits().items()) if first <= p <= last]
+          if [r["pos"] for r in rows] != list(range(first, last + 1)):
+              sys.exit("::error::commits.txt does not hold every position of study_settings.json")
+          print("commits=" + json.dumps(rows))
+          print("benchmarks=" + json.dumps([study.short(b) for b in S["benchmarks"]]))
+          EOF
+          cat "$GITHUB_OUTPUT"
+
+  record:
+    needs: test
+    name: record ${{ matrix.pos }}${{ matrix.patches != '' && format(' + {0}', matrix.patches) || '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.test.outputs.commits) }}
+    env:
+      POS: ${{ matrix.pos }}
+      TAG: ${{ matrix.tag }}
+      SHA: ${{ matrix.sha }}
+      PATCHES: ${{ matrix.patches }}
+      NEW_PATCH: ${{ matrix.new }}
+    steps:
+      - name: Start the clock
+        run: |
+          mkdir -p out build
+          echo "job_start=$(date +%s)" > out/timing.txt
+          echo "$(date -u +%H:%M:%S) start" > out/stage.txt
+      - name: Check out the case-study files
+        uses: actions/checkout@v7
+        with:
+          path: tools
+      - name: Check out jenetics at the studied commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.sha }}
+          path: jenetics-src
+      - name: Check out the same commit again for the clean variant
+        if: matrix.new != ''
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.sha }}
+          path: jenetics-clean
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install numpy
+        run: |
+          echo "$(date -u +%H:%M:%S) python" >> out/stage.txt
+          pip install numpy
+          pip freeze > out/python-packages.txt
+      - name: Apply the injection patches
+        run: |
+          echo "$(date -u +%H:%M:%S) patches" >> out/stage.txt
+          test "$(python3 tools/case-study/study.py patches --pos "$POS")" = "$PATCHES" || {
+            echo "::error title=Patches differ::the test job and study.py disagree on the patches of commit $POS"; exit 1; }
+          apply() {  # $1 = source folder, then the patch names
+            local dir=$1; shift
+            for p in "$@"; do
+              P="$PWD/tools/case-study/injections/$p.patch"
+              git -C "$dir" apply --check "$P"
+              git -C "$dir" apply "$P"
+            done
+            git -C "$dir" diff --stat
+          }
+          # shellcheck disable=SC2086
+          apply jenetics-src $PATCHES
+          for p in $PATCHES; do
+            cp "tools/case-study/injections/$p.patch" out/
+            sha256sum "tools/case-study/injections/$p.patch" | sed 's|  .*/|  |' >> out/patch-sha256.txt
+          done
+          if [ -n "$NEW_PATCH" ]; then
+            CLEAN=$(python3 tools/case-study/study.py patches --pos "$POS" --without-new)
+            echo "clean variant of commit $POS: ${CLEAN:-no patch}" | tee out/clean-variant.txt
+            # shellcheck disable=SC2086
+            apply jenetics-clean $CLEAN
+          fi
+      # Java setup v2 (25 Nov 2026), as in ab-check v2.2: cache-jdk, two retries after 60 s and 180 s.
+      - name: Set up Java 8 (Temurin 8.0.514+1)
+        id: java1
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+          cache-jdk: true
+      - name: Pause and clear the failed Java download
+        if: steps.java1.outcome == 'failure'
+        run: |
+          echo "First Java setup failed; waiting 60 s and retrying from scratch."
+          rm -rf "$RUNNER_TOOL_CACHE/Java_Temurin-Hotspot_jdk/8.0.514-1"
+          sleep 60
+      - name: Set up Java 8 (Temurin 8.0.514+1), second try
+        id: java2
+        if: steps.java1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+          cache-jdk: true
+      - name: Pause longer and clear the failed Java download
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome == 'failure'
+        run: |
+          echo "Second Java setup failed; waiting 180 s and retrying from scratch."
+          rm -rf "$RUNNER_TOOL_CACHE/Java_Temurin-Hotspot_jdk/8.0.514-1"
+          sleep 180
+      - name: Set up Java 8 (Temurin 8.0.514+1), third try
+        id: java3
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+          cache-jdk: true
+      - name: Stop if Java could not be set up
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome != 'success' && steps.java3.outcome != 'success'
+        run: |
+          echo "$(date -u +%H:%M:%S) java setup failed" >> out/stage.txt
+          echo "::error title=Java setup failed three times::Temurin 8.0.514+1 could not be downloaded and verified. Re-run this job (Re-run failed jobs); do not change the JDK."
+          exit 1
+      - name: Check the JDK build
+        run: |
+          echo "$(date -u +%H:%M:%S) jdk check" >> out/stage.txt
+          java -version 2>&1 | tee out/jdk.txt
+          if ! { grep -q "Temurin" out/jdk.txt && grep -q "1.8.0_514-b01" out/jdk.txt; }; then
+            echo "::error title=Wrong JDK::expected Temurin 1.8.0_514-b01"; exit 1
+          fi
+      - name: Log the CPU model of this VM
+        working-directory: tools
+        run: |
+          echo "$(date -u +%H:%M:%S) cpu log" >> ../out/stage.txt
+          python3 -m nasc_ci machine --out ../out/machine.json
+          lscpu > ../out/lscpu.txt
+          grep -m1 "model name" /proc/cpuinfo
+      - name: Build the JMH jar (G1, up to 3 tries)
+        run: |
+          set -o pipefail
+          build() {  # $1 = source folder, $2 = name of the log and class-path file
+            for wait in 0 60 180; do
+              if [ "$wait" -gt 0 ]; then
+                echo "Build of $2 failed; waiting $wait s and trying again." | tee -a "out/build-$2.log"
+                sleep "$wait"
+              fi
+              echo "$(date -u +%H:%M:%S) build $2 (try after $wait s)" >> out/stage.txt
+              if ( cd "$1" && chmod +x gradlew && ./gradlew --no-daemon --console=plain \
+                     --init-script "$GITHUB_WORKSPACE/tools/case-study/print-jmh-classpath.gradle" \
+                     :jenetics:jmhJar :jenetics:printJmhClasspath ) 2>&1 | tee -a "out/build-$2.log"; then
+                # shellcheck disable=SC2012
+                JAR=$(ls "$1"/jenetics/build/libs/*-jmh.jar | head -1)
+                echo "$PWD/$JAR:$(cat "$1/jenetics/build/jmh-classpath.txt")" > "$2-classpath.txt"
+                return 0
+              fi
+            done
+            echo "::error title=Build failed three times::commit $POS ($2): see out/build-$2.log in the artifact. Re-run failed jobs."
+            return 1
+          }
+          build jenetics-src main
+          if [ -n "$NEW_PATCH" ]; then build jenetics-clean clean; fi
+      - name: Hash the compiled code
+        working-directory: tools
+        run: |
+          echo "$(date -u +%H:%M:%S) code hash" >> ../out/stage.txt
+          python3 -m nasc_ci codehash ../jenetics-src/jenetics/build/classes/java/main \
+            ../jenetics-src/jenetics/build/classes/java/jmh --out ../out/code.json
+          if [ -n "$NEW_PATCH" ]; then
+            python3 -m nasc_ci codehash ../jenetics-clean/jenetics/build/classes/java/main \
+              ../jenetics-clean/jenetics/build/classes/java/jmh --out ../out/code-clean.json
+          fi
+      - name: Check the benchmarks
+        run: |
+          echo "$(date -u +%H:%M:%S) benchmark list" >> out/stage.txt
+          java -cp "$(cat main-classpath.txt)" org.openjdk.jmh.Main -l > out/benchmark-list.txt
+          python3 tools/case-study/check_benchmarks.py out/benchmark-list.txt "$POS" "$SHA"
+      - name: Record the 10 benchmarks (about 15 minutes)
+        run: |
+          set -o pipefail
+          echo "$(date -u +%H:%M:%S) record" >> out/stage.txt
+          RE=$(python3 tools/case-study/study.py regex)
+          echo "measure_start=$(date +%s)" >> out/timing.txt
+          # shellcheck disable=SC2086
+          java -cp "$(cat main-classpath.txt)" org.openjdk.jmh.Main "$RE" $JMH_RECORD \
+            -rf json -rff out/jmh-record.json 2>&1 | tee out/jmh-record.log
+          echo "measure_end=$(date +%s)" >> out/timing.txt
+      - name: Check the recording (study.py record)
+        run: |
+          set -o pipefail
+          echo "$(date -u +%H:%M:%S) check recording" >> out/stage.txt
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          python3 tools/case-study/study.py record --json out/jmh-record.json --pos "$POS" --commit "$SHA" \
+            --patches "$PATCHES" --machine out/machine.json --code out/code.json --timing out/timing.txt \
+            --out out 2>&1 | tee out/record-check.log | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+      - name: Pack the build(s) for the confirm jobs
+        run: |
+          set -o pipefail
+          echo "$(date -u +%H:%M:%S) pack" >> out/stage.txt
+          python3 tools/case-study/study.py pack --classpath main-classpath.txt --out "build/c$TAG" | tee out/pack.log
+          cp out/code.json "build/c$TAG/code.json"
+          if [ -n "$NEW_PATCH" ]; then
+            python3 tools/case-study/study.py pack --classpath clean-classpath.txt --out "build/c$TAG-clean" | tee -a out/pack.log
+            cp out/code-clean.json "build/c$TAG-clean/code.json"
+          fi
+          echo "$(date -u +%H:%M:%S) done" >> out/stage.txt
+      - name: Explain the failure (G2)
+        if: failure()
+        run: |
+          # shellcheck disable=SC2012
+          LOG=$(ls -t out/*.log 2>/dev/null | head -1 || true)
+          {
+            echo "record job of commit $POS FAILED. Last stage reached:"
+            tail -1 out/stage.txt 2>/dev/null || echo "(none)"
+            echo
+            if [ -n "$LOG" ]; then echo "Last 40 lines of $LOG:"; tail -40 "$LOG"; else echo "No log was written."; fi
+          } > out/FAILED.txt
+          cat out/FAILED.txt
+      - name: Upload the recording
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-study-record-c${{ matrix.tag }}
+          path: out/
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Upload the packed build
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-study-build-c${{ matrix.tag }}
+          path: build/
+          retention-days: 14
+          overwrite: true
+          if-no-files-found: error
+
+  profile:
+    needs: [test, record]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install numpy
+        run: pip install numpy
+      - name: Download the 15 recordings
+        uses: actions/download-artifact@v7
+        with:
+          pattern: full-study-record-c*
+          path: records
+      - name: Completeness gate, then the frozen noise profile
+        run: |
+          set -o pipefail
+          mkdir -p profile
+          ls records
+          python3 case-study/study.py check-records --records records
+          python3 case-study/study.py profile --records records --out profile | tee profile/profile.log
+          cat profile/profile.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the profile
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-study-profile
+          path: profile/
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+
+  confirm:
+    needs: [test, profile]
+    name: confirm ${{ matrix.bench }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        bench: ${{ fromJSON(needs.test.outputs.benchmarks) }}
+    env:
+      BENCH: ${{ matrix.bench }}
+    steps:
+      - name: Start the clock
+        run: |
+          mkdir -p out
+          echo "job_start=$(date +%s)" > out/timing.txt
+          echo "$(date -u +%H:%M:%S) start" > out/stage.txt
+      - name: Check out the case-study files
+        uses: actions/checkout@v7
+        with:
+          path: tools
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install numpy
+        run: |
+          pip install numpy
+          pip freeze > out/python-packages.txt
+      # Java setup v2 (25 Nov 2026), as in ab-check v2.2: cache-jdk, two retries after 60 s and 180 s.
+      - name: Set up Java 8 (Temurin 8.0.514+1)
+        id: java1
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+          cache-jdk: true
+      - name: Pause and clear the failed Java download
+        if: steps.java1.outcome == 'failure'
+        run: |
+          echo "First Java setup failed; waiting 60 s and retrying from scratch."
+          rm -rf "$RUNNER_TOOL_CACHE/Java_Temurin-Hotspot_jdk/8.0.514-1"
+          sleep 60
+      - name: Set up Java 8 (Temurin 8.0.514+1), second try
+        id: java2
+        if: steps.java1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+          cache-jdk: true
+      - name: Pause longer and clear the failed Java download
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome == 'failure'
+        run: |
+          echo "Second Java setup failed; waiting 180 s and retrying from scratch."
+          rm -rf "$RUNNER_TOOL_CACHE/Java_Temurin-Hotspot_jdk/8.0.514-1"
+          sleep 180
+      - name: Set up Java 8 (Temurin 8.0.514+1), third try
+        id: java3
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "8.0.514+1"
+          cache-jdk: true
+      - name: Stop if Java could not be set up
+        if: steps.java1.outcome == 'failure' && steps.java2.outcome != 'success' && steps.java3.outcome != 'success'
+        run: |
+          echo "$(date -u +%H:%M:%S) java setup failed" >> out/stage.txt
+          echo "::error title=Java setup failed three times::Temurin 8.0.514+1 could not be downloaded and verified. Re-run this job (Re-run failed jobs); do not change the JDK."
+          exit 1
+      - name: Check the JDK build
+        run: |
+          echo "$(date -u +%H:%M:%S) jdk check" >> out/stage.txt
+          java -version 2>&1 | tee out/jdk.txt
+          if ! { grep -q "Temurin" out/jdk.txt && grep -q "1.8.0_514-b01" out/jdk.txt; }; then
+            echo "::error title=Wrong JDK::expected Temurin 1.8.0_514-b01"; exit 1
+          fi
+      - name: Log the CPU model of this VM
+        working-directory: tools
+        run: |
+          echo "$(date -u +%H:%M:%S) cpu log" >> ../out/stage.txt
+          python3 -m nasc_ci machine --out ../out/machine.json
+          lscpu > ../out/lscpu.txt
+          grep -m1 "model name" /proc/cpuinfo
+      - name: Download the profile
+        uses: actions/download-artifact@v7
+        with:
+          name: full-study-profile
+          path: profile
+      - name: Download the packed builds
+        uses: actions/download-artifact@v7
+        with:
+          pattern: full-study-build-c*
+          path: builds
+          merge-multiple: true
+      - id: gt
+        name: Does this benchmark have an injection?
+        run: |
+          GT=$(python3 tools/case-study/study.py ground-truth --bench "$BENCH")
+          read -r POS PATCH <<< "$GT" || true
+          echo "pos=${POS:-}" >> "$GITHUB_OUTPUT"
+          echo "patch=${PATCH:-}" >> "$GITHUB_OUTPUT"
+          ls builds
+          echo "same-VM ground truth: ${POS:+commit $POS, patch $PATCH}${POS:-none (no injection)}"
+      - name: Confirm commits 6-15 (one confirmation per flagged commit, about 5 min each)
+        run: |
+          set -o pipefail
+          echo "$(date -u +%H:%M:%S) confirm" >> out/stage.txt
+          python3 tools/case-study/study.py confirm --history profile/history.json --bench "$BENCH" \
+            --builds builds --machine out/machine.json --timing out/timing.txt --out out 2>&1 | tee out/confirm.log
+          echo "$(date -u +%H:%M:%S) done" >> out/stage.txt
+      - name: Explain the failure (G2)
+        if: failure()
+        run: |
+          # shellcheck disable=SC2012
+          LOG=$(ls -t out/*.log 2>/dev/null | head -1 || true)
+          {
+            echo "confirm job of $BENCH FAILED. Last stage reached:"
+            tail -1 out/stage.txt 2>/dev/null || echo "(none)"
+            echo
+            if [ -n "$LOG" ]; then echo "Last 40 lines of $LOG:"; tail -40 "$LOG"; else echo "No log was written."; fi
+          } > out/FAILED.txt
+          cat out/FAILED.txt
+      - name: Upload the confirmations
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-study-confirm-${{ matrix.bench }}
+          path: out/
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Same-VM ground truth (10 pairs, about 11 minutes)
+        if: ${{ !cancelled() && steps.gt.outputs.pos != '' }}
+        env:
+          GT_POS: ${{ steps.gt.outputs.pos }}
+          GT_PATCH: ${{ steps.gt.outputs.patch }}
+        run: |
+          set -o pipefail
+          mkdir -p gt
+          echo "job_start=$(date +%s)" > gt/timing.txt
+          echo "$(date -u +%H:%M:%S) ground truth" > gt/stage.txt
+          C=$(printf "c%02d" "$GT_POS")
+          GT_SHA=$(awk -v p="$GT_POS" '$1 == p {print $2}' tools/case-study/commits.txt)
+          PAIRS=$(python3 -c "import json; print(json.load(open('tools/case-study/study_settings.json'))['ground_truth_pairs'])")
+          python3 tools/case-study/study.py classpath --dir "builds/$C-clean" > gt/a-classpath.txt
+          python3 tools/case-study/study.py classpath --dir "builds/$C" > gt/b-classpath.txt
+          echo "A = commit $GT_POS without $GT_PATCH (builds/$C-clean), B = commit $GT_POS as recorded (builds/$C)"
+          python3 tools/case-study/ab_check.py run --a "$GT_SHA" --b "$GT_SHA" --a-pos "$GT_POS" --b-pos "$GT_POS" \
+            --a-cp gt/a-classpath.txt --b-cp gt/b-classpath.txt --bench "$BENCH" --pairs "$PAIRS" --out gt \
+            --machine out/machine.json --code-a "builds/$C-clean/code.json" --code-b "builds/$C/code.json" \
+            --timing gt/timing.txt --b-patch "tools/case-study/injections/$GT_PATCH.patch" 2>&1 | tee gt/ab-check.log
+          cp out/machine.json out/lscpu.txt gt/
+          echo "$(date -u +%H:%M:%S) done" >> gt/stage.txt
+          cat gt/report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Explain a ground-truth failure (G2)
+        if: ${{ failure() && steps.gt.outputs.pos != '' }}
+        run: |
+          mkdir -p gt
+          {
+            echo "same-VM ground truth of $BENCH FAILED. Last stage reached:"
+            tail -1 gt/stage.txt 2>/dev/null || echo "(not started: an earlier step failed)"
+            echo
+            if [ -f gt/ab-check.log ]; then echo "Last 40 lines of gt/ab-check.log:"; tail -40 gt/ab-check.log; fi
+          } > gt/FAILED.txt
+          cat gt/FAILED.txt
+      - name: Upload the ground truth
+        if: ${{ !cancelled() && steps.gt.outputs.pos != '' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-study-gt-${{ matrix.bench }}
+          path: gt/
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+
+  report:
+    needs: [test, record, profile, confirm]
+    if: always() && needs.test.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install numpy
+        run: pip install numpy
+      # A missing artifact must not stop the report: the gate in study.py report names it (G3).
+      - name: Download the recordings
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          pattern: full-study-record-c*
+          path: records
+      - name: Download the profile
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          name: full-study-profile
+          path: profile
+      - name: Download the confirmations
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          pattern: full-study-confirm-*
+          path: confirms
+      - name: Download the same-VM ground truth
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          pattern: full-study-gt-*
+          path: ground-truth
+      - name: Completeness gate, scores and report (red and INCOMPLETE if anything is missing)
+        run: |
+          mkdir -p records profile confirms ground-truth report
+          set +e
+          python3 case-study/study.py report --records records --profile profile --confirms confirms \
+            --ground-truth ground-truth --out report > report/report.log 2>&1
+          status=$?
+          set -e
+          cat report/report.log
+          cat report/report.md >> "$GITHUB_STEP_SUMMARY" || echo "## report.md was not written: see the log" >> "$GITHUB_STEP_SUMMARY"
+          exit $status
+      - name: Upload the report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-study-report-run${{ github.run_id }}
+          path: report/
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
