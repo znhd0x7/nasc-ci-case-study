@@ -2,7 +2,8 @@
 
 Step 1 of 4 (26 Nov 2026): the settings, the injections per commit, recording one commit and
 freezing the noise profile. Step 2 (26 Nov 2026): confirm, one benchmark over commits 6-15.
-Steps 3-4 add the scorer and report, and the workflow.
+Step 3 (26 Nov 2026): the scorer (nasc_sim.score_series' rules) and the report. Step 4 adds the
+workflow.
 
   python3 case-study/study.py regex
       the JMH regular expression that selects exactly the 10 benchmarks of study_settings.json
@@ -43,6 +44,17 @@ Steps 3-4 add the scorer and report, and the workflow.
   python3 case-study/study.py ground-truth --bench heapSort80
       "<first commit> <patch>" if the benchmark has an injection (its confirm job then runs the
       same-VM A/B with ab_check.py), nothing otherwise
+  python3 case-study/study.py report --records DIR --profile DIR --confirms DIR --ground-truth DIR --out DIR
+      the completeness gate over everything (15 recordings, the profile, 10 confirm.json, the same-VM
+      A/B of the 4 injected benchmarks); if anything is missing: report.md starts with INCOMPLETE,
+      names it, and the command exits 1 (no scores are written). Otherwise every detector-arm series
+      is scored with score_series' rules (false alerts only before v*, the first alert at or after
+      v* is the detection, later ones duplicates) and pooled as summarize_scores pools them;
+      report.md and study.json give the scores, every confirmation, the same-VM ground truth per
+      injected benchmark (with the calibration of that CPU type as background), the observed sd of
+      the confirmation pairs against the frozen profile's sqrt(2) s_b (one-sided chi-square, 5 %),
+      base-flag rates for record pairs on the same and on mixed CPU types, the CPU mix of the
+      frozen profile, and the limitation (4 injected instances among 100 checks).
 Needs numpy. Run from the repository root.
 """
 
@@ -440,53 +452,53 @@ def measure_batches(run, cand_pos, ref_pos, n_b, k_max, order):
     return out
 
 
-def nasc_decision(batches, prof, s):
+def nasc_decision(batches, prof, s, ref_level=None):
     """NASC-CI's nasc_confirm on the measured batches, read in the order they were measured; it
-    stops at its own boundary, so later batches do not change its decision."""
+    stops at its own boundary, so later batches do not change its decision. ref_level is used only
+    with s["scale"] == "stored" (the equivalence test); the study uses "fresh"."""
     queue = {"candidate": [b["candidate"] for b in batches], "reference": [b["reference"] for b in batches]}
     used = {"candidate": 0, "reference": 0}
 
     def measure(side, n_blocks):
         used[side] += 1
         return queue[side][used[side] - 1]
-    return nasc.nasc_confirm(measure, prof, float(np.mean(queue["reference"])), s).to_dict()
+    level = float(np.mean(queue["reference"])) if ref_level is None else float(ref_level)
+    return nasc.nasc_confirm(measure, prof, level, s).to_dict()
 
 
-def static_decisions(batches, prof, s):
+def static_decisions(batches, prof, s, scale=None):
     """static (nasc_sim.repeat_confirm with n_blocks = n_b and the cap) and static-mid (src/34
-    static_mid) on all K_max batches. Scale: the mean of the reference runs of this confirmation."""
+    static_mid) on all K_max batches. Scale: the mean of the reference runs of this confirmation
+    (scale=None, the study), or the level given (the equivalence test passes nasc_sim's m_b)."""
     cand = np.array([b["candidate"] for b in batches])
     ref = np.array([b["reference"] for b in batches])
     k = len(batches)
-    level = float(ref.mean())
+    level = float(ref.mean()) if scale is None else float(scale)
     s_b = math.sqrt(prof.c_t ** 2 + prof.c_w ** 2 / prof.n_b)
-    total = float(np.clip((cand - ref) / (level * s_b), -s["cap"], s["cap"]).sum())
-    bound = NormalDist().inv_cdf(1 - s["alpha"]) * math.sqrt(2 * k)
-    slowdown = float(((cand - ref) / level).mean())
-    significant = total >= bound
-    return {"static": {"confirmed": bool(significant), "total": total, "bound": bound, "scale": level,
+    total = 0.0
+    for c, r in zip(cand, ref):                                  # summed batch by batch, as nasc_sim
+        total += float(np.clip((c - r) / (level * s_b), -s["cap"], s["cap"]))
+    bound = NormalDist().inv_cdf(1 - s["alpha"]) * np.sqrt(2 * k)
+    slowdown = 0.0
+    for c, r in zip(cand, ref):                                  # as src/34 static_mid accumulates it
+        slowdown += (c - r) / level / k
+    significant = bool(total >= bound)
+    return {"static": {"confirmed": significant, "total": total, "bound": float(bound), "scale": level,
                        "s_b": s_b, "batches": k},
             "static-mid": {"confirmed": bool(significant and slowdown >= s["delta_min"] / 2), "total": total,
-                           "bound": bound, "slowdown": slowdown, "scale": level, "s_b": s_b, "batches": k}}
+                           "bound": float(bound), "slowdown": float(slowdown), "scale": level, "s_b": s_b,
+                           "batches": k}}
 
 
-def run_confirm(h, bench, run, machine_info=None, seed=1):
-    """Walks commits 6-15 for one benchmark. h: the profile job's history (versions 1-15, frozen
-    profile). run(pos, n_blocks, tag) -> (block means, file) measures one fresh run."""
-    S = settings()
-    s = h["settings"]
-    first, last = S["checked_commits"]
+def walk_series(runs, s, dets, arms, v_star, first, last, decide, seed=1, bench_index=0):
+    """The walk of nasc_sim.check_series for every detector-arm at once. runs: {pos: (runs, blocks)};
+    decide(k) -> the confirmation of k against k-1 (a dict with "n_b" and "nasc", "static",
+    "static-mid", each with "confirmed"; "nasc" also "extra_blocks"), asked at most once per commit
+    and only when a confirming arm flags k. -> ({pos: {(d, a): flag}}, {pos: confirmation}, series)."""
     w = s["window"]
-    versions = {v["index"]: v for v in h["versions"]}
-    runs = {p: np.array(v["results"][bench]["runs"], dtype=float) for p, v in versions.items()}
-    prof = noise.Noise(**h["profile"]["benchmarks"][bench])
-    step = step_of(bench)
-    v_star = step[1] if step else None
-    dets, arms = S["detectors"], S["arms"]
     start = {(d, a): 1 for d in dets for a in arms}             # first version each history may use
     series = {d: {a: [] for a in arms} for d in dets}
-    checks = []
-    bench_index = S["benchmarks"].index(bench)
+    all_flags, confirmations = {}, {}
     for k in range(first, last + 1):
         boot = detectors.detect("bootstrap", [runs[k - 1]], runs[k],
                                 np.random.default_rng([seed, bench_index, k]), s)   # parent only: same for every arm
@@ -497,44 +509,62 @@ def run_confirm(h, bench, run, machine_info=None, seed=1):
                 f = boot if d == "bootstrap" else detectors.detect(d, [runs[p] for p in window], runs[k], None, s)
                 flags[(d, a)] = {"window": [window[0], window[-1]], "flagged": bool(f.flagged),
                                  "change": float(f.change), "statistic": float(f.statistic)}
-        need = any(flags[(d, a)]["flagged"] for d in dets for a in CONFIRMING)
-        conf = None
-        if need:
-            t0 = time.time()
-            batches = measure_batches(run, k, k - 1, prof.n_b, s["k_max"], s.get("order", "abba"))
-            n = nasc_decision(batches, prof, s)
-            st = static_decisions(batches, prof, s)
-            d_rel = np.array([b["candidate"] / b["reference"] - 1 for b in batches])
-            conf = {"candidate": k, "reference": k - 1, "n_b": prof.n_b, "batches": batches,
-                    "nasc": n, "static": st["static"], "static-mid": st["static-mid"],
-                    "pair_sd": float(d_rel.std(ddof=1)), "pair_mean": float(d_rel.mean()),
-                    "minutes": (time.time() - t0) / 60}
-        decided = {"nasc": conf and conf["nasc"]["confirmed"], "static": conf and conf["static"]["confirmed"],
-                   "static-mid": conf and conf["static-mid"]["confirmed"]}
-        cost = {"none": 0} if conf is None else {
-            "none": 0, "static": 2 * s["k_max"] * prof.n_b, "static-mid": 2 * s["k_max"] * prof.n_b,
-            "nasc": conf["nasc"]["extra_blocks"]}
+        need = any(flags[(d, a)]["flagged"] for d in dets for a in arms if a in CONFIRMING)
+        conf = decide(k) if need else None
+        cost = {} if conf is None else {"static": 2 * s["k_max"] * conf["n_b"],
+                                        "static-mid": 2 * s["k_max"] * conf["n_b"],
+                                        "nasc": conf["nasc"]["extra_blocks"]}
         for d in dets:
             for a in arms:
                 f = flags[(d, a)]
-                alerted = f["flagged"] if a == "none" else bool(f["flagged"] and decided[a])
+                alerted = f["flagged"] if a == "none" else bool(f["flagged"] and conf[a]["confirmed"])
                 blocks = cost.get(a, 0) if f["flagged"] else 0
                 f.update(alerted=alerted, blocks=blocks, start=start[(d, a)])
                 series[d][a].append([k, f["flagged"], alerted, blocks])
                 if alerted and v_star is not None and k >= v_star:
                     start[(d, a)] = k                          # accepted: new baseline from here
+        all_flags[k], confirmations[k] = flags, conf
+    return all_flags, confirmations, series
+
+
+def run_confirm(h, bench, run, machine_info=None, seed=1):
+    """Walks commits 6-15 for one benchmark. h: the profile job's history (versions 1-15, frozen
+    profile). run(pos, n_blocks, tag) -> (block means, file) measures one fresh run."""
+    S = settings()
+    s = h["settings"]
+    first, last = S["checked_commits"]
+    versions = {v["index"]: v for v in h["versions"]}
+    runs = {p: np.array(v["results"][bench]["runs"], dtype=float) for p, v in versions.items()}
+    prof = noise.Noise(**h["profile"]["benchmarks"][bench])
+    step = step_of(bench)
+    v_star = step[1] if step else None
+    dets, arms = S["detectors"], S["arms"]
+
+    def decide(k):
+        t0 = time.time()
+        batches = measure_batches(run, k, k - 1, prof.n_b, s["k_max"], s.get("order", "abba"))
+        st = static_decisions(batches, prof, s)
+        d_rel = np.array([b["candidate"] / b["reference"] - 1 for b in batches])
+        conf = {"candidate": k, "reference": k - 1, "n_b": prof.n_b, "batches": batches,
+                "nasc": nasc_decision(batches, prof, s), "static": st["static"], "static-mid": st["static-mid"],
+                "pair_sd": float(d_rel.std(ddof=1)), "pair_mean": float(d_rel.mean()),
+                "minutes": (time.time() - t0) / 60}
+        print(f"commit {k}: confirmation: NASC {'alert' if conf['nasc']['confirmed'] else 'dismiss'} after "
+              f"{conf['nasc']['batches']}, static {'alert' if conf['static']['confirmed'] else 'dismiss'}, "
+              f"static-mid {'alert' if conf['static-mid']['confirmed'] else 'dismiss'}", flush=True)
+        return conf
+
+    flags, confs, series = walk_series(runs, s, dets, arms, v_star, first, last, decide, seed,
+                                       S["benchmarks"].index(bench))
+    checks = []
+    for k in range(first, last + 1):
         checks.append({"pos": k, "parent": k - 1,
                        "record_cpus": [machine.cpu_of(versions[k - 1].get("machine")),
                                        machine.cpu_of(versions[k].get("machine"))],
                        "same_code_as_parent": (versions[k].get("code") or {}).get("sha256")
                        == (versions[k - 1].get("code") or {}).get("sha256"),
-                       "flags": {d: {a: flags[(d, a)] for a in arms} for d in dets},
-                       "confirmation": conf})
-        n_flag = sum(flags[(d, "none")]["flagged"] for d in dets)
-        print(f"commit {k}: {n_flag} of {len(dets)} detectors flag (arm none)"
-              + ("" if conf is None else f"; confirmation: NASC {'alert' if conf['nasc']['confirmed'] else 'dismiss'} "
-                 f"after {conf['nasc']['batches']}, static {'alert' if conf['static']['confirmed'] else 'dismiss'}, "
-                 f"static-mid {'alert' if conf['static-mid']['confirmed'] else 'dismiss'}"), flush=True)
+                       "flags": {d: {a: flags[k][(d, a)] for a in arms} for d in dets},
+                       "confirmation": confs[k]})
     return {"study": STUDY, "tool": VERSION, "nasc_ci_source": source_hash(),
             "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "benchmark": bench, "v_star": v_star, "patch": step[0] if step else None,
@@ -557,6 +587,261 @@ def cmd_confirm(a):
     result["timing"] = read_timing(a.timing)
     (out / "confirm.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
     print(f"confirm.json written: {sum(c['confirmation'] is not None for c in result['checks'])} confirmations")
+
+
+# ---------------------------------------------------------------- scorer and report (step 3)
+CALIBRATION = HERE / "calibration_background.json"
+BLOCKS_PER_VERSION = 12                       # 3 runs x 4 blocks, as nasc_sim.BLOCKS_PER_VERSION
+# one-sided 95 % quantiles of chi-square, df 1..30 (above 30: Wilson-Hilferty)
+CHI2_95 = [3.841, 5.991, 7.815, 9.488, 11.070, 12.592, 14.067, 15.507, 16.919, 18.307, 19.675, 21.026,
+           22.362, 23.685, 24.996, 26.296, 27.587, 28.869, 30.144, 31.410, 32.671, 33.924, 35.172, 36.415,
+           37.652, 38.885, 40.113, 41.337, 42.557, 43.773]
+
+
+def chi2_95(df):
+    if 1 <= df <= 30:
+        return CHI2_95[df - 1]
+    z = NormalDist().inv_cdf(0.95)
+    return df * (1 - 2 / (9 * df) + z * math.sqrt(2 / (9 * df))) ** 3
+
+
+def score(rows, v_star):
+    """nasc_sim.score_series for one series. rows: [commit, flagged, alerted, blocks];
+    v_star: the injection's first commit, None for a benchmark without a step (delta = 0)."""
+    has_step = v_star is not None
+    clean = [r for r in rows if not has_step or r[0] < v_star]
+    after = [r for r in rows if has_step and r[0] >= v_star]
+    hits = [r[0] for r in after if r[2]]
+    return {"has_step": has_step, "clean_checks": len(clean), "clean_flags": sum(bool(r[1]) for r in clean),
+            "false_alerts": sum(bool(r[2]) for r in clean),
+            "flagged_at_v_star": any(r[1] for r in after if r[0] == v_star),
+            "detected": len(hits) > 0, "delay": hits[0] - v_star if hits else None,
+            "duplicates": max(len(hits) - 1, 0), "checked_versions": len(rows),
+            "confirm_blocks": sum(r[3] for r in rows)}
+
+
+def summarize(scores):
+    """Pools the scores of several series as nasc_sim.summarize_scores (sums first, then ratios)."""
+    steps = [x for x in scores if x["has_step"]]
+    clean = sum(x["clean_checks"] for x in scores)
+    fa = sum(x["false_alerts"] for x in scores)
+    det = sum(x["detected"] for x in steps)
+    recorded = BLOCKS_PER_VERSION * sum(x["checked_versions"] for x in scores)
+    ratio = lambda a, b: a / b if b else None  # noqa: E731
+    return {"series": len(scores), "clean_checks": clean, "clean_flags": sum(x["clean_flags"] for x in scores),
+            "base_flag_rate": sum(x["clean_flags"] for x in scores) / max(clean, 1),   # max(.., 1) as nasc_sim
+            "false_alerts": fa, "FPR": fa / max(clean, 1), "steps": len(steps), "detected": det,
+            "base_hit_rate": ratio(sum(x["flagged_at_v_star"] for x in steps), len(steps)),
+            "recall": ratio(det, len(steps)),
+            "recall_at_v_star": ratio(sum(x["delay"] == 0 for x in steps), len(steps)),
+            "recall_late": ratio(sum(x["delay"] is not None and x["delay"] > 0 for x in steps), len(steps)),
+            "FDP": ratio(fa, fa + det) if steps else None,
+            "duplicates": sum(x["duplicates"] for x in scores),
+            "confirm_blocks": sum(x["confirm_blocks"] for x in scores),
+            "T": (recorded + sum(x["confirm_blocks"] for x in scores)) / recorded if recorded else None}
+
+
+def load_confirms(folder, S):
+    found, problems = {}, []
+    for f in sorted(Path(folder).glob("*/confirm.json")):
+        try:
+            c = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            problems.append(f"{f.parent.name}: unreadable confirm.json ({e})")
+            continue
+        b = c.get("benchmark")
+        if b in found:
+            problems.append(f"{short(b)}: confirmed twice")
+        elif not c.get("complete") or len(c.get("checks", [])) != S["checked_commits"][1] - S["checked_commits"][0] + 1:
+            problems.append(f"{short(b)}: confirm.json incomplete")
+        found[b] = c
+    absent = [short(b) for b in S["benchmarks"] if b not in found]
+    if absent:
+        problems.insert(0, "benchmarks not confirmed (job failed or artifact missing): " + ", ".join(absent))
+    return found, problems
+
+
+def load_ground_truth(folder, S):
+    found, problems = {}, []
+    for f in sorted(Path(folder).glob("*/ab.json")):
+        try:
+            g = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            problems.append(f"{f.parent.name}: unreadable ab.json ({e})")
+            continue
+        for r in g.get("results", []):
+            found[r["benchmark"]] = {"difference": r["difference"], "ci95": r["ci95_welch"], "pairs": r["pairs"],
+                                     "order_effect": r["order_effect"],
+                                     "cpu": (g.get("machine") or {}).get("cpu_model"),
+                                     "a": g.get("a"), "b": g.get("b"), "same_code": g.get("same_code")}
+    absent = [short(b) for b in S["benchmarks"] if step_of(b) and b not in found]
+    if absent:
+        problems.insert(0, "same-VM ground truth missing (job failed or artifact missing): " + ", ".join(absent))
+    return found, problems
+
+
+def sd_check(conf_list, prof):
+    """Observed sd of the relative pair differences c / r - 1 (pooled within confirmations) against
+    the frozen profile's prediction sqrt(2) s_b; one-sided chi-square test at 5 %."""
+    ss, df = 0.0, 0
+    for c in conf_list:
+        d = np.array([b["candidate"] / b["reference"] - 1 for b in c["batches"]])
+        ss += float(((d - d.mean()) ** 2).sum())
+        df += len(d) - 1
+    if df == 0:
+        return None
+    s_b = math.sqrt(prof["c_t"] ** 2 + prof["c_w"] ** 2 / prof["n_b"])
+    predicted = math.sqrt(2) * s_b
+    observed = math.sqrt(ss / df)
+    stat = ss / predicted ** 2
+    return {"confirmations": len(conf_list), "df": df, "observed_sd": observed, "predicted_sd": predicted,
+            "chi2": stat, "chi2_95": chi2_95(df), "higher": bool(stat > chi2_95(df))}
+
+
+def cpu_kind(cpus):
+    if any(c is None for c in cpus):
+        return "unknown"
+    return "same" if len(set(cpus)) == 1 else "mixed"
+
+
+def cmd_report(a):
+    S = settings()
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    records, problems = load_records(a.records)
+    pfile = Path(a.profile) / "profile.json"
+    if not pfile.exists():
+        problems.append("profile.json missing (profile job failed or artifact missing)")
+    confirms, p2 = load_confirms(a.confirms, S)
+    truth, p3 = load_ground_truth(a.ground_truth, S)
+    problems += p2 + p3
+    if problems:
+        text = "\n".join(["## INCOMPLETE: the full study is not complete; no scores are given", ""]
+                         + [f"- {p}" for p in problems] + ["", "Re-run the failed jobs (Re-run failed jobs keeps "
+                                                          "the jobs that succeeded), then the report again.", ""])
+        (out / "report.md").write_text(text, encoding="utf-8")
+        print(text)
+        error("Full study incomplete", problems)
+    P = json.loads(pfile.read_text(encoding="utf-8"))
+    calib = json.loads(CALIBRATION.read_text(encoding="utf-8"))
+    dets, arms = S["detectors"], S["arms"]
+    per_series = {(d, ar): {} for d in dets for ar in arms}
+    for b, c in confirms.items():
+        for d in dets:
+            for ar in arms:
+                per_series[(d, ar)][b] = score(c["series"][d][ar], c["v_star"])
+    pooled = {f"{d} | {ar}": summarize(list(per_series[(d, ar)].values())) for d in dets for ar in arms}
+    # NASC batches against static's K_max
+    nasc_k = [c2["confirmation"]["nasc"]["batches"] for c in confirms.values() for c2 in c["checks"]
+              if c2["confirmation"]]
+    # confirmations, ground truth, sd check, CPU grouping
+    conf_rows, sd_rows, gt_rows, cpu_groups = [], {}, [], {}
+    for b in S["benchmarks"]:
+        c = confirms[b]
+        cpu_c = machine.cpu_of(c.get("machine"))
+        cl = [x["confirmation"] for x in c["checks"] if x["confirmation"]]
+        sd_rows[b] = sd_check(cl, c["noise"])
+        for x in c["checks"]:
+            kind = cpu_kind(x["record_cpus"])
+            if c["v_star"] is None or x["pos"] < c["v_star"]:
+                for d in dets:
+                    g = cpu_groups.setdefault((d, kind), [0, 0])
+                    g[0] += 1
+                    g[1] += bool(x["flags"][d]["none"]["flagged"])
+            cf = x["confirmation"]
+            if cf:
+                conf_rows.append({"benchmark": b, "pos": x["pos"], "record": kind, "record_cpus": x["record_cpus"],
+                                  "confirm_cpu": cpu_c, "n_b": cf["n_b"], "pair_mean": cf["pair_mean"],
+                                  "pair_sd": cf["pair_sd"], "nasc": cf["nasc"]["confirmed"],
+                                  "nasc_k": cf["nasc"]["batches"], "nasc_end": cf["nasc"]["ended_by"],
+                                  "static": cf["static"]["confirmed"], "static_mid": cf["static-mid"]["confirmed"],
+                                  "same_code": x["same_code_as_parent"]})
+        if c["v_star"] is not None:
+            t = truth[b]
+            bg = (calib.get(c["patch"]) or {}).get(t["cpu"] or "", {}).get(short(b))
+            det = {f"{d} | {ar}": per_series[(d, ar)][b]["delay"] for d in dets for ar in arms}
+            gt_rows.append({"benchmark": b, "v_star": c["v_star"], "patch": c["patch"], "confirm_cpu": cpu_c,
+                            "truth": t, "background": bg, "delay": det,
+                            "other_cpu_than_truth": cpu_c != t["cpu"]})
+    checks = sum(x["checked_versions"] for v in per_series[(dets[0], "none")].values() for x in [v])
+    clean = sum(x["clean_checks"] for x in per_series[(dets[0], "none")].values())
+    at_v = sum(1 for c in confirms.values() if c["v_star"] is not None)
+    summary = {"study": STUDY, "tool": VERSION, "nasc_ci_source": source_hash(),
+               "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+               "settings": S, "pooled": pooled,
+               "per_series": {f"{d} | {ar}": {short(b): v for b, v in per_series[(d, ar)].items()}
+                              for d in dets for ar in arms},
+               "nasc_batches": nasc_k, "confirmations": conf_rows,
+               "sd_check": {short(b): v for b, v in sd_rows.items()}, "ground_truth": gt_rows,
+               "base_flags_by_record_cpus": {f"{d} | {k}": v for (d, k), v in sorted(cpu_groups.items())},
+               "profile_cpus": {k: P["profile"][k] for k in ("versions", "cpus", "cpu_types", "mixed_cpu")},
+               "record_cpus": P["record_cpus"],
+               "limitation": {"checks": checks, "clean": clean, "at_v_star": at_v, "after_v_star": checks - clean - at_v,
+                              "instances": at_v}}
+    (out / "study.json").write_text(json.dumps(summary, indent=1), encoding="utf-8")
+    text = study_report(summary)
+    (out / "report.md").write_text(text, encoding="utf-8")
+    print(text)
+
+
+def study_report(R):
+    S = R["settings"]
+    p = lambda x, d=1: "–" if x is None else f"{x * 100:.{d}f}%"  # noqa: E731
+    sp = lambda x, d=2: "–" if x is None else f"{x * 100:+.{d}f}%"  # noqa: E731
+    lim = R["limitation"]
+    L = ["## NASC-CI case study: full study", "",
+         f"`{R['tool']}`, source `{R['nasc_ci_source']}`; {R['study']}.", "",
+         f"**Limitation.** The study has {lim['instances']} injected regression instances among {lim['checks']} "
+         f"checked benchmark-commits ({lim['clean']} clean checks, {lim['at_v_star']} at the injection's first "
+         f"commit, {lim['after_v_star']} after it). It shows NASC-CI working in real CI; error rates and costs "
+         "with statistical weight come from the simulation.", "",
+         "### Scores per detector and arm (rules of nasc_sim.score_series, pooled as summarize_scores)", "",
+         "| Detector | Arm | Clean checks | Base flags | False alerts (FPR) | Detected (of steps) | At v* / later | "
+         "Duplicates | Extra blocks | T |", "|---|---|---|---|---|---|---|---|---|---|"]
+    for name, x in R["pooled"].items():
+        d, ar = name.split(" | ")
+        L.append(f"| {d} | {ar} | {x['clean_checks']} | {x['clean_flags']} | {x['false_alerts']} ({p(x['FPR'])}) | "
+                 f"{x['detected']} of {x['steps']} | {p(x['recall_at_v_star'], 0)} / {p(x['recall_late'], 0)} | "
+                 f"{x['duplicates']} | {x['confirm_blocks']} | {x['T']:.3f} |")
+    k = R["nasc_batches"]
+    if k:
+        L += ["", f"NASC used {np.mean(k):.2f} batches per confirmation on average (static and static-mid always "
+                  f"{S['nasc']['k_max']}): {len(k)} confirmations, batches " + ", ".join(map(str, k)) + "."]
+    L += ["", "### Same-VM ground truth of the injections (measured on the confirm job's VM)", "",
+          "| Benchmark | Injection | Confirm VM | True size on this VM | Calibration on this CPU type | "
+          "Delay per detector-arm (– = missed) |", "|---|---|---|---|---|---|"]
+    for g in R["ground_truth"]:
+        t, bg = g["truth"], g["background"]
+        delays = "; ".join(f"{n.replace(' | ', ' ')}: {'–' if v is None else v}" for n, v in g["delay"].items())
+        L.append(f"| `{short(g['benchmark'])}` | {g['patch']} from commit {g['v_star']} | {g['confirm_cpu']} | "
+                 f"{sp(t['difference'])} ± {p(t['ci95'], 2)} ({t['pairs']} pairs) | "
+                 f"{'not calibrated' if bg is None else f'{sp(bg[0])} ± {p(bg[1], 2)}'} | {delays} |")
+    L += ["", "### Confirmations (each one: 5 batches of commit k against k-1 on the confirm VM)", "",
+          "| Benchmark | Commit | Record VMs k-1 / k | Confirm VM | n_b | Pair mean (sd) | NASC | static | "
+          "static-mid | Same code as k-1 |", "|---|---|---|---|---|---|---|---|---|---|"]
+    yn = lambda v: "alert" if v else "dismiss"  # noqa: E731
+    for c in R["confirmations"]:
+        L.append(f"| `{short(c['benchmark'])}` | {c['pos']} | {c['record']} | {c['confirm_cpu']} | {c['n_b']} | "
+                 f"{sp(c['pair_mean'])} ({p(c['pair_sd'], 2)}) | {yn(c['nasc'])} (K={c['nasc_k']}) | "
+                 f"{yn(c['static'])} | {yn(c['static_mid'])} | {'yes' if c['same_code'] else 'no'} |")
+    L += ["", "### Noise of the confirmation pairs against the frozen profile", "",
+          "| Benchmark | Confirmations | Observed sd of pairs | Predicted sqrt(2) s_b | Clearly higher (chi-square, 5 %) |",
+          "|---|---|---|---|---|"]
+    for b, v in R["sd_check"].items():
+        if v:
+            L.append(f"| `{b}` | {v['confirmations']} | {p(v['observed_sd'], 2)} | {p(v['predicted_sd'], 2)} | "
+                     f"{'**yes**' if v['higher'] else 'no'} (chi2 {v['chi2']:.1f} vs {v['chi2_95']:.1f}, df {v['df']}) |")
+    L += ["", "### Base flags on clean checks by the CPU types of the two recording VMs (arm none)", "",
+          "| Detector | Record VMs | Clean checks | Base flags |", "|---|---|---|---|"]
+    for name, (n, f) in R["base_flags_by_record_cpus"].items():
+        d, kind = name.split(" | ")
+        L.append(f"| {d} | {kind} CPU type | {n} | {f} ({p(f / n if n else None)}) |")
+    pc = R["profile_cpus"]
+    L += ["", f"Frozen noise profile: commits {pc['versions'][0]}-{pc['versions'][-1]}, "
+              f"{'MIXED CPU types' if pc['mixed_cpu'] else 'one CPU type'}: " + ", ".join(map(str, pc["cpus"])) + ".",
+          "Recording VMs: " + "; ".join(f"{k}: {v}" for k, v in sorted(R["record_cpus"].items(), key=lambda kv: int(kv[0])))
+          + ".", ""]
+    return "\n".join(L)
 
 
 def main(argv=None):
@@ -596,12 +881,19 @@ def main(argv=None):
     x.add_argument("--out", required=True)
     x = sub.add_parser("ground-truth")
     x.add_argument("--bench", required=True)
+    x = sub.add_parser("report")
+    x.add_argument("--records", required=True)
+    x.add_argument("--profile", required=True)
+    x.add_argument("--confirms", required=True)
+    x.add_argument("--ground-truth", required=True)
+    x.add_argument("--out", required=True)
     a = p.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     {"regex": cmd_regex, "patches": cmd_patches, "new-patch": cmd_new_patch, "record": cmd_record,
      "pack": cmd_pack, "classpath": cmd_classpath, "check-records": cmd_check_records,
-     "profile": cmd_profile, "confirm": cmd_confirm, "ground-truth": cmd_ground_truth}[a.cmd](a)
+     "profile": cmd_profile, "confirm": cmd_confirm, "ground-truth": cmd_ground_truth,
+     "report": cmd_report}[a.cmd](a)
 
 
 if __name__ == "__main__":
