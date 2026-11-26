@@ -1,5 +1,9 @@
-# full-study v1 (26 Nov 2026). The NASC-CI case study on 15 jenetics commits, started by hand
-# (Actions tab > full-study > Run workflow). All settings are in case-study/study_settings.json.
+# full-study v1.1 (26 Nov 2026). The NASC-CI case study on 15 jenetics commits, started by hand
+# (Actions tab > full-study > Run workflow, no inputs). All settings are in case-study/study_settings.json.
+# v1.1 (26 Nov 2026): the report job also uploads ONE artifact with every result of the run,
+#   full-study-run<run id>-all (records/, profile/, confirms/, ground-truth/, report/), the only zip to
+#   download for storage into the private results folder.
+#   The packed builds are not in it (jars, kept 14 days only for the confirm jobs and re-runs).
 #   test     the unit tests and the NASC-CI version stamp; the 15 commits with their injection patches
 #   record   15 jobs, one per commit, each on its own VM: build (with the patches due at that commit:
 #            heapsort from 9, heapsort + indexof from 13), compiled-code hash, CPU log, the 10 benchmarks
@@ -570,8 +574,22 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: full-study-report-run${{ github.run_id }}
+          name: full-study-report
           path: report/
+          retention-days: 90
+          overwrite: true
+          if-no-files-found: error
+      - name: Upload every result of this run as one artifact (for storage)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: full-study-run${{ github.run_id }}-all
+          path: |
+            records/
+            profile/
+            confirms/
+            ground-truth/
+            report/
           retention-days: 90
           overwrite: true
           if-no-files-found: error
