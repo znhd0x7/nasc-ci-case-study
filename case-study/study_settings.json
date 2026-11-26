@@ -1,0 +1,49 @@
+{
+ "study": "full study v1 (26 Nov 2026)",
+ "note": "Fixed settings of the NASC-CI case study (full study). Changing anything here changes the study; the record jobs copy this file into every artifact.",
+ "positions": [1, 15],
+ "history_commits": [1, 5],
+ "checked_commits": [6, 15],
+ "benchmarks": [
+  "io.jenetics.internal.util.IndexSorterPerf.heapSort80",
+  "io.jenetics.internal.util.IndexSorterPerf.heapSort250",
+  "io.jenetics.internal.util.IndexSorterPerf.heapSort320",
+  "io.jenetics.PhenotypeEvaluationPerf.halfEvaluated",
+  "io.jenetics.PhenotypeEvaluationPerf.unevaluated",
+  "io.jenetics.ProbabilitySelectorIndexOfPerf.serialIndexOf250",
+  "io.jenetics.util.RandomEnginePerf.RandomPerf.nextDouble",
+  "io.jenetics.util.RandomEnginePerf.RandomPerf.nextLong",
+  "io.jenetics.util.SeqPerf.arrayList_contains",
+  "io.jenetics.util.SeqPerf.mseq_contains"
+ ],
+ "excluded_timer_floor": [
+  "io.jenetics.util.SeqPerf.arrayList_forEachLoop",
+  "io.jenetics.util.SeqPerf.arrayList_forLoop",
+  "io.jenetics.util.SeqPerf.arrayList_get",
+  "io.jenetics.util.SeqPerf.mseq_forEachLoop",
+  "io.jenetics.util.SeqPerf.mseq_forLoop",
+  "io.jenetics.util.SeqPerf.mseq_get"
+ ],
+ "jmh_record": {"forks": 3, "warmup": 10, "iterations": 20, "time": "1s"},
+ "jmh_rerun": {"warmup": 10, "time": "1s"},
+ "nasc": {
+  "window": 5,
+  "threshold_p": 0.02,
+  "ttest_tau": 2.0,
+  "bootstrap_level": 0.99,
+  "delta_min": 0.02,
+  "alpha": 0.05,
+  "beta": 0.05,
+  "k_max": 5,
+  "n_max": 4,
+  "cap": 3.0,
+  "noise_min_versions": 3,
+  "scale": "fresh",
+  "order": "abba",
+  "profile_versions": 5
+ },
+ "detectors": ["threshold", "ttest", "bootstrap"],
+ "arms": ["none", "static", "static-mid", "nasc"],
+ "bootstrap_seed": 1,
+ "ground_truth_pairs": 10
+}
