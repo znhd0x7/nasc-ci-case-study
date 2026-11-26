@@ -1,7 +1,8 @@
 """full study v1 (26 Nov 2026): the NASC-CI case study on 15 jenetics commits.
 
 Step 1 of 4 (26 Nov 2026): the settings, the injections per commit, recording one commit and
-freezing the noise profile. Steps 2-4 add confirm, the scorer and report, and the workflow.
+freezing the noise profile. Step 2 (26 Nov 2026): confirm, one benchmark over commits 6-15.
+Steps 3-4 add the scorer and report, and the workflow.
 
   python3 case-study/study.py regex
       the JMH regular expression that selects exactly the 10 benchmarks of study_settings.json
@@ -28,6 +29,20 @@ freezing the noise profile. Steps 2-4 add confirm, the scorer and report, and th
       after the gate: the history of the 15 recordings and the runner noise profile frozen from
       commits 1-5 (NASC-CI 0.3 freeze_profile: c_w, c_t, n_b, feasibility, the CPU of each of
       those five VMs and whether they mix CPU types), next to the reference profile
+  python3 case-study/study.py confirm --history DIR/history.json --bench heapSort80 \
+      --builds DIR --machine machine.json --out DIR
+      one benchmark, commits 6-15 in order, as nasc_sim.check_series walks a series: for every
+      detector (threshold, t-test, bootstrap) and arm (none, static, static-mid, NASC) its own
+      window and baseline; when any confirming arm flags commit k, ONE confirmation of k against
+      k-1 on this VM: always K_max = 5 batches of n_b blocks per side in ABBA order, from the packed
+      builds DIR/c<k> and DIR/c<k-1>. NASC decides at its own stopping point (fresh scale, level
+      rule, cap), static and static-mid from all 5 batches (scale: the mean of the 5 reference
+      runs; static-mid also needs a mean slowdown >= delta_min / 2). An accepted alert at or after
+      the injection's first commit restarts that detector-arm's history there. Writes confirm.json
+      (every check, every flag, every batch, the series per detector and arm) and the raw JMH files.
+  python3 case-study/study.py ground-truth --bench heapSort80
+      "<first commit> <patch>" if the benchmark has an injection (its confirm job then runs the
+      same-VM A/B with ab_check.py), nothing otherwise
 Needs numpy. Run from the repository root.
 """
 
@@ -35,9 +50,13 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import re
 import shutil
+import subprocess
 import sys
+import time
+from statistics import NormalDist
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -46,7 +65,8 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from nasc_ci import VERSION, check, history, jmh, machine, noise  # noqa: E402
+from nasc_ci import VERSION, check, detectors, history, jmh, machine, noise  # noqa: E402
+from nasc_ci import confirm as nasc  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 SETTINGS = HERE / "study_settings.json"
@@ -357,6 +377,188 @@ def profile_report(P, S):
     return "\n".join(L)
 
 
+# ---------------------------------------------------------------- confirm (step 2)
+CONFIRMING = ("static", "static-mid", "nasc")
+
+
+def full_name(bench_short, S):
+    hits = [b for b in S["benchmarks"] if short(b) == bench_short]
+    if len(hits) != 1:
+        error("Unknown benchmark", [f"{bench_short}: {len(hits)} matches in study_settings.json"])
+    return hits[0]
+
+
+def cmd_ground_truth(a):
+    step = step_of(full_name(a.bench, settings()))
+    print("" if step is None else f"{step[1]} {step[0]}")
+
+
+class JmhRunner:
+    """One fresh JMH run (one JVM fork) of one benchmark from a packed build of commit pos."""
+
+    def __init__(self, bench, builds, out, wi, time_):
+        self.bench, self.builds, self.out, self.wi, self.time = bench, Path(builds), Path(out), wi, time_
+
+    def classpath(self, pos):
+        d = (self.builds / f"c{pos:02d}").resolve()
+        names = [n for n in (d / "classpath.txt").read_text(encoding="utf-8").split() if n]
+        return ":".join(str(d / n) for n in names)
+
+    def __call__(self, pos, n_blocks, tag):
+        stem = self.out / "runs" / tag
+        stem.parent.mkdir(parents=True, exist_ok=True)
+        cmd = ["java", "-cp", self.classpath(pos), "org.openjdk.jmh.Main", "^" + re.escape(self.bench) + "$",
+               "-bm", "sample", "-tu", "ns", "-f", "1", "-wi", str(self.wi), "-i", str(n_blocks * jmh.BLOCK_SIZE),
+               "-w", self.time, "-r", self.time, "-foe", "true", "-rf", "json", "-rff", str(stem) + ".json"]
+        with open(str(stem) + ".log", "w", encoding="utf-8") as log:
+            subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT, check=True)
+        runs = jmh.read(str(stem) + ".json")[self.bench]["runs"]
+        if len(runs) != 1 or len(runs[0]) != n_blocks:
+            raise RuntimeError(f"{stem}.json: expected one fork of {n_blocks} blocks")
+        return [float(x) for x in runs[0]], str(stem.relative_to(self.out)) + ".json"
+
+
+def measure_batches(run, cand_pos, ref_pos, n_b, k_max, order):
+    """K_max batches of candidate (commit cand_pos) and reference (ref_pos) runs, n_b blocks each,
+    in NASC-CI's batch order. -> list of {"batch", "order", "candidate", "reference", ...}."""
+    out = []
+    for j in range(1, k_max + 1):
+        o = nasc.batch_order(j, order)
+        sides = ("candidate", "reference") if o == nasc.CAND_FIRST else ("reference", "candidate")
+        rec = {"batch": j, "order": o}
+        for side in sides:
+            pos = cand_pos if side == "candidate" else ref_pos
+            t0 = time.time()
+            blocks, file = run(pos, n_b, f"c{cand_pos:02d}/batch{j}-{side}")
+            rec[side] = float(np.mean(blocks))
+            rec[side + "_blocks"] = blocks
+            rec[side + "_file"] = file
+            rec[side + "_seconds"] = round(time.time() - t0, 1)
+        out.append(rec)
+        print(f"   commit {cand_pos} vs {ref_pos}, batch {j} ({o}): candidate {rec['candidate']:.5g}, "
+              f"reference {rec['reference']:.5g} ns/op", flush=True)
+    return out
+
+
+def nasc_decision(batches, prof, s):
+    """NASC-CI's nasc_confirm on the measured batches, read in the order they were measured; it
+    stops at its own boundary, so later batches do not change its decision."""
+    queue = {"candidate": [b["candidate"] for b in batches], "reference": [b["reference"] for b in batches]}
+    used = {"candidate": 0, "reference": 0}
+
+    def measure(side, n_blocks):
+        used[side] += 1
+        return queue[side][used[side] - 1]
+    return nasc.nasc_confirm(measure, prof, float(np.mean(queue["reference"])), s).to_dict()
+
+
+def static_decisions(batches, prof, s):
+    """static (nasc_sim.repeat_confirm with n_blocks = n_b and the cap) and static-mid (src/34
+    static_mid) on all K_max batches. Scale: the mean of the reference runs of this confirmation."""
+    cand = np.array([b["candidate"] for b in batches])
+    ref = np.array([b["reference"] for b in batches])
+    k = len(batches)
+    level = float(ref.mean())
+    s_b = math.sqrt(prof.c_t ** 2 + prof.c_w ** 2 / prof.n_b)
+    total = float(np.clip((cand - ref) / (level * s_b), -s["cap"], s["cap"]).sum())
+    bound = NormalDist().inv_cdf(1 - s["alpha"]) * math.sqrt(2 * k)
+    slowdown = float(((cand - ref) / level).mean())
+    significant = total >= bound
+    return {"static": {"confirmed": bool(significant), "total": total, "bound": bound, "scale": level,
+                       "s_b": s_b, "batches": k},
+            "static-mid": {"confirmed": bool(significant and slowdown >= s["delta_min"] / 2), "total": total,
+                           "bound": bound, "slowdown": slowdown, "scale": level, "s_b": s_b, "batches": k}}
+
+
+def run_confirm(h, bench, run, machine_info=None, seed=1):
+    """Walks commits 6-15 for one benchmark. h: the profile job's history (versions 1-15, frozen
+    profile). run(pos, n_blocks, tag) -> (block means, file) measures one fresh run."""
+    S = settings()
+    s = h["settings"]
+    first, last = S["checked_commits"]
+    w = s["window"]
+    versions = {v["index"]: v for v in h["versions"]}
+    runs = {p: np.array(v["results"][bench]["runs"], dtype=float) for p, v in versions.items()}
+    prof = noise.Noise(**h["profile"]["benchmarks"][bench])
+    step = step_of(bench)
+    v_star = step[1] if step else None
+    dets, arms = S["detectors"], S["arms"]
+    start = {(d, a): 1 for d in dets for a in arms}             # first version each history may use
+    series = {d: {a: [] for a in arms} for d in dets}
+    checks = []
+    bench_index = S["benchmarks"].index(bench)
+    for k in range(first, last + 1):
+        boot = detectors.detect("bootstrap", [runs[k - 1]], runs[k],
+                                np.random.default_rng([seed, bench_index, k]), s)   # parent only: same for every arm
+        flags = {}
+        for d in dets:
+            for a in arms:
+                window = list(range(max(start[(d, a)], k - w), k))
+                f = boot if d == "bootstrap" else detectors.detect(d, [runs[p] for p in window], runs[k], None, s)
+                flags[(d, a)] = {"window": [window[0], window[-1]], "flagged": bool(f.flagged),
+                                 "change": float(f.change), "statistic": float(f.statistic)}
+        need = any(flags[(d, a)]["flagged"] for d in dets for a in CONFIRMING)
+        conf = None
+        if need:
+            t0 = time.time()
+            batches = measure_batches(run, k, k - 1, prof.n_b, s["k_max"], s.get("order", "abba"))
+            n = nasc_decision(batches, prof, s)
+            st = static_decisions(batches, prof, s)
+            d_rel = np.array([b["candidate"] / b["reference"] - 1 for b in batches])
+            conf = {"candidate": k, "reference": k - 1, "n_b": prof.n_b, "batches": batches,
+                    "nasc": n, "static": st["static"], "static-mid": st["static-mid"],
+                    "pair_sd": float(d_rel.std(ddof=1)), "pair_mean": float(d_rel.mean()),
+                    "minutes": (time.time() - t0) / 60}
+        decided = {"nasc": conf and conf["nasc"]["confirmed"], "static": conf and conf["static"]["confirmed"],
+                   "static-mid": conf and conf["static-mid"]["confirmed"]}
+        cost = {"none": 0} if conf is None else {
+            "none": 0, "static": 2 * s["k_max"] * prof.n_b, "static-mid": 2 * s["k_max"] * prof.n_b,
+            "nasc": conf["nasc"]["extra_blocks"]}
+        for d in dets:
+            for a in arms:
+                f = flags[(d, a)]
+                alerted = f["flagged"] if a == "none" else bool(f["flagged"] and decided[a])
+                blocks = cost.get(a, 0) if f["flagged"] else 0
+                f.update(alerted=alerted, blocks=blocks, start=start[(d, a)])
+                series[d][a].append([k, f["flagged"], alerted, blocks])
+                if alerted and v_star is not None and k >= v_star:
+                    start[(d, a)] = k                          # accepted: new baseline from here
+        checks.append({"pos": k, "parent": k - 1,
+                       "record_cpus": [machine.cpu_of(versions[k - 1].get("machine")),
+                                       machine.cpu_of(versions[k].get("machine"))],
+                       "same_code_as_parent": (versions[k].get("code") or {}).get("sha256")
+                       == (versions[k - 1].get("code") or {}).get("sha256"),
+                       "flags": {d: {a: flags[(d, a)] for a in arms} for d in dets},
+                       "confirmation": conf})
+        n_flag = sum(flags[(d, "none")]["flagged"] for d in dets)
+        print(f"commit {k}: {n_flag} of {len(dets)} detectors flag (arm none)"
+              + ("" if conf is None else f"; confirmation: NASC {'alert' if conf['nasc']['confirmed'] else 'dismiss'} "
+                 f"after {conf['nasc']['batches']}, static {'alert' if conf['static']['confirmed'] else 'dismiss'}, "
+                 f"static-mid {'alert' if conf['static-mid']['confirmed'] else 'dismiss'}"), flush=True)
+    return {"study": STUDY, "tool": VERSION, "nasc_ci_source": source_hash(),
+            "time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "benchmark": bench, "v_star": v_star, "patch": step[0] if step else None,
+            "settings": s, "noise": prof.to_dict(), "machine": machine_info, "bootstrap_seed": seed,
+            "checks": checks, "series": series, "complete": True}
+
+
+def cmd_confirm(a):
+    S = settings()
+    bench = full_name(a.bench, S)
+    h = history.load(a.history)
+    if "profile" not in h or len(h["versions"]) != S["positions"][1]:
+        error("History incomplete", ["the profile job's history.json must hold all 15 versions and the frozen profile"])
+    out = Path(a.out)
+    out.mkdir(parents=True, exist_ok=True)
+    load = lambda p: json.loads(Path(p).read_text(encoding="utf-8")) if p else None  # noqa: E731
+    run = JmhRunner(bench, a.builds, out, S["jmh_rerun"]["warmup"], S["jmh_rerun"]["time"])
+    print(f"{STUDY}; {VERSION}; source {source_hash()}; confirm {short(bench)}", flush=True)
+    result = run_confirm(h, bench, run, load(a.machine), S["bootstrap_seed"])
+    result["timing"] = read_timing(a.timing)
+    (out / "confirm.json").write_text(json.dumps(result, indent=1), encoding="utf-8")
+    print(f"confirm.json written: {sum(c['confirmation'] is not None for c in result['checks'])} confirmations")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=STUDY)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -385,12 +587,21 @@ def main(argv=None):
     x = sub.add_parser("profile")
     x.add_argument("--records", required=True)
     x.add_argument("--out", required=True)
+    x = sub.add_parser("confirm")
+    x.add_argument("--history", required=True)
+    x.add_argument("--bench", required=True, help="short name, e.g. heapSort80")
+    x.add_argument("--builds", required=True, help="folder with the packed builds c05 ... c15")
+    x.add_argument("--machine")
+    x.add_argument("--timing")
+    x.add_argument("--out", required=True)
+    x = sub.add_parser("ground-truth")
+    x.add_argument("--bench", required=True)
     a = p.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     {"regex": cmd_regex, "patches": cmd_patches, "new-patch": cmd_new_patch, "record": cmd_record,
      "pack": cmd_pack, "classpath": cmd_classpath, "check-records": cmd_check_records,
-     "profile": cmd_profile}[a.cmd](a)
+     "profile": cmd_profile, "confirm": cmd_confirm, "ground-truth": cmd_ground_truth}[a.cmd](a)
 
 
 if __name__ == "__main__":
